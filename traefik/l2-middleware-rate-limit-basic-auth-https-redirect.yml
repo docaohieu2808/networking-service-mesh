@@ -1,0 +1,87 @@
+# Traefik L2 — Middlewares: Rate Limiting, Basic Auth, HTTPS Redirect
+# Demonstrates: middleware chaining, rate limit, basicAuth, redirectScheme
+# Usage: docker compose -f l2-middleware-rate-limit-basic-auth-https-redirect.yml up -d
+#
+# Generate htpasswd entry:
+#   echo $(htpasswd -nb admin secretpassword) | sed -e s/\\$/\\$\\$/g
+# Then paste into TRAEFIK_BASIC_AUTH_USERS env var or directly into the label.
+
+version: "3.9"
+
+services:
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik-l2
+    restart: unless-stopped
+    command:
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      - "--api.dashboard=true"
+
+      # EntryPoints
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+
+      # Redirect all HTTP → HTTPS at entrypoint level (alternative to per-router middleware)
+      # Uncomment to enable global redirect:
+      # - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      # - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      - "--providers.docker.network=traefik_net"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - traefik_net
+
+  app:
+    image: traefik/whoami
+    container_name: app-l2
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+
+      # ── Middleware: HTTPS redirect ──────────────────────────────────────────
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true"
+
+      # ── Middleware: Rate limiting ───────────────────────────────────────────
+      # average: requests per period, burst: burst headroom, period: window
+      - "traefik.http.middlewares.rate-limit-standard.ratelimit.average=100"
+      - "traefik.http.middlewares.rate-limit-standard.ratelimit.burst=50"
+      - "traefik.http.middlewares.rate-limit-standard.ratelimit.period=1m"
+
+      # ── Middleware: Basic auth ──────────────────────────────────────────────
+      # Format: user:bcrypt-hash  (dollar signs doubled in compose labels)
+      - "traefik.http.middlewares.basic-auth-admin.basicauth.users=admin:$$apr1$$xyz$$hashedpassword"
+      - "traefik.http.middlewares.basic-auth-admin.basicauth.realm=Admin Area"
+      - "traefik.http.middlewares.basic-auth-admin.basicauth.removeheader=true"
+
+      # ── Middleware: Strip path prefix ───────────────────────────────────────
+      - "traefik.http.middlewares.strip-api-prefix.stripprefix.prefixes=/api"
+
+      # ── HTTP router (redirect only) ─────────────────────────────────────────
+      - "traefik.http.routers.app-http.entrypoints=web"
+      - "traefik.http.routers.app-http.rule=Host(`app.example.com`)"
+      - "traefik.http.routers.app-http.middlewares=redirect-to-https"
+
+      # ── HTTPS router with rate limit + auth ────────────────────────────────
+      - "traefik.http.routers.app-https.entrypoints=websecure"
+      - "traefik.http.routers.app-https.rule=Host(`app.example.com`)"
+      # Middleware order matters: rate-limit first, then auth
+      - "traefik.http.routers.app-https.middlewares=rate-limit-standard,basic-auth-admin"
+      - "traefik.http.routers.app-https.tls=true"
+
+      - "traefik.http.services.app.loadbalancer.server.port=80"
+    networks:
+      - traefik_net
+
+networks:
+  traefik_net:
+    name: traefik_net
+    driver: bridge

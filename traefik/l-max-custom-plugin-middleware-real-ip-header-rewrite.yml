@@ -1,0 +1,105 @@
+# Traefik L-MAX — Custom Middleware Plugin: Real-IP extraction + header rewriting
+# Demonstrates: experimental plugins, plugin configuration via labels, custom middleware logic
+# Plugin used: https://github.com/soulbalz/traefik-real-ip (real IP from X-Forwarded-For)
+# Additional plugin: https://github.com/containous/traefik-plugin-rewrite-headers
+#
+# Requirements:
+#   - Traefik v2.10+ or v3.x with experimental.plugins enabled
+#   - Plugins are downloaded at startup from the Traefik Plugin Catalog
+#
+# Usage: docker compose -f l-max-custom-plugin-middleware-real-ip-header-rewrite.yml up -d
+
+version: "3.9"
+
+services:
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik-lmax
+    restart: unless-stopped
+    command:
+      - "--log.level=DEBUG"
+      - "--accesslog=true"
+      - "--accesslog.fields.headers.defaultmode=keep"
+
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      - "--providers.docker.network=traefik_net"
+
+      # ── Experimental: enable local plugin loading ──────────────────────────
+      - "--experimental.localPlugins.rewriteHeaders.moduleName=github.com/traefik/plugin-rewriteheaders"
+
+      # ── Plugin: Real-IP from Traefik Plugin Catalog ────────────────────────
+      # Downloaded from https://plugins.traefik.io at startup
+      - "--experimental.plugins.real-ip.moduleName=github.com/soulbalz/traefik-real-ip"
+      - "--experimental.plugins.real-ip.version=v1.0.3"
+
+      # ── Plugin: Block malicious bots (catalog plugin) ──────────────────────
+      - "--experimental.plugins.bot-blocker.moduleName=github.com/maksimkurb/traefik-bot-blocker"
+      - "--experimental.plugins.bot-blocker.version=v0.2.0"
+
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      # Mount local plugin source for rewriteHeaders (local plugin mode)
+      - "./plugins/rewriteHeaders:/plugins-local/src/github.com/traefik/plugin-rewriteheaders:ro"
+    networks:
+      - traefik_net
+
+  app:
+    image: traefik/whoami
+    container_name: app-lmax
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+
+      # ── Middleware: Real-IP plugin ─────────────────────────────────────────
+      # Extracts real client IP from X-Forwarded-For, sets X-Real-IP header
+      - "traefik.http.middlewares.real-ip-extract.plugin.real-ip.excludednets=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+      # ── Middleware: Rewrite response headers (local plugin) ────────────────
+      - "traefik.http.middlewares.strip-server-header.plugin.rewriteHeaders.rewrites[0].header=Server"
+      - "traefik.http.middlewares.strip-server-header.plugin.rewriteHeaders.rewrites[0].regex=.*"
+      - "traefik.http.middlewares.strip-server-header.plugin.rewriteHeaders.rewrites[0].replacement="
+
+      # ── Middleware: Bot blocker plugin ─────────────────────────────────────
+      - "traefik.http.middlewares.block-bots.plugin.bot-blocker.blackListedBots[0]=Googlebot"
+      - "traefik.http.middlewares.block-bots.plugin.bot-blocker.blackListedBots[1]=Baiduspider"
+      - "traefik.http.middlewares.block-bots.plugin.bot-blocker.returnStatusCode=403"
+
+      # ── Middleware: Custom request header injection ────────────────────────
+      # Built-in headers middleware (no plugin needed) — add metadata headers
+      - "traefik.http.middlewares.inject-request-id.headers.customrequestheaders.X-Request-Source=traefik-edge"
+      - "traefik.http.middlewares.inject-request-id.headers.customrequestheaders.X-Forwarded-Proto=https"
+
+      # ── Middleware: Security headers (built-in) ────────────────────────────
+      - "traefik.http.middlewares.security-headers.headers.frameDeny=true"
+      - "traefik.http.middlewares.security-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.security-headers.headers.browserXssFilter=true"
+      - "traefik.http.middlewares.security-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
+      - "traefik.http.middlewares.security-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.security-headers.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.security-headers.headers.stsPreload=true"
+      - "traefik.http.middlewares.security-headers.headers.contentSecurityPolicy=default-src 'self'"
+      - "traefik.http.middlewares.security-headers.headers.permissionsPolicy=camera=(), microphone=(), geolocation=()"
+
+      # ── Router: chain all middlewares ──────────────────────────────────────
+      - "traefik.http.routers.app.entrypoints=web"
+      - "traefik.http.routers.app.rule=Host(`app.localhost`)"
+      - "traefik.http.routers.app.middlewares=real-ip-extract,strip-server-header,block-bots,inject-request-id,security-headers"
+      - "traefik.http.services.app.loadbalancer.server.port=80"
+    networks:
+      - traefik_net
+
+networks:
+  traefik_net:
+    name: traefik_net
+    driver: bridge

@@ -1,0 +1,170 @@
+# Istio L1 — Install profile: minimal, demo, and ambient mode options
+# Demonstrates: IstioOperator CR, Helm values, profile selection, component tuning
+#
+# Install options (choose one):
+#
+# Option A — istioctl with IstioOperator (classic sidecar mode):
+#   istioctl install -f l1-install-profile-minimal-demo-ambient-helm-values.yaml --verify
+#
+# Option B — Helm (recommended for GitOps):
+#   helm repo add istio https://istio-release.storage.googleapis.com/charts
+#   helm repo update
+#   helm install istio-base istio/base -n istio-system --create-namespace
+#   helm install istiod istio/istiod -n istio-system -f l1-install-profile-minimal-demo-ambient-helm-values.yaml --wait
+#
+# Option C — Ambient mesh (no sidecars, ztunnel + waypoint proxies):
+#   istioctl install --set profile=ambient --verify
+
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: istio-control-plane
+  namespace: istio-system
+spec:
+  # profile: minimal | default | demo | empty | ambient | preview
+  # minimal: istiod only, no ingress gateway (add separately)
+  # demo:    all components enabled, reduced resource requests (for dev/testing)
+  # default: production-grade defaults
+  profile: default
+
+  # Mesh-wide configuration (goes into ConfigMap istio in istio-system)
+  meshConfig:
+    # Enable access logging to stdout (JSON format for log aggregators)
+    accessLogFile: /dev/stdout
+    accessLogFormat: |
+      {
+        "start_time": "%START_TIME%",
+        "method": "%REQ(:METHOD)%",
+        "path": "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%",
+        "protocol": "%PROTOCOL%",
+        "response_code": "%RESPONSE_CODE%",
+        "duration": "%DURATION%",
+        "upstream_host": "%UPSTREAM_HOST%",
+        "x_forwarded_for": "%REQ(X-FORWARDED-FOR)%",
+        "trace_id": "%REQ(X-B3-TRACEID)%"
+      }
+
+    # Enable distributed tracing (Zipkin-compatible endpoint)
+    enableTracing: true
+    defaultConfig:
+      tracing:
+        zipkin:
+          address: jaeger-collector.observability:9411
+        sampling: 100.0   # 100% sampling in dev; reduce to 1.0 in prod
+
+    # mTLS mode: STRICT enforces mTLS for all in-mesh traffic
+    # Can be overridden per-namespace with PeerAuthentication
+    # Set to PERMISSIVE during migration, STRICT once all services are enrolled
+    defaultConfig:
+      holdApplicationUntilProxyStarts: true   # prevent app starting before sidecar ready
+
+    # Outbound traffic policy: REGISTRY_ONLY blocks traffic to unregistered services
+    # ALLOW_ANY: allow all outbound (permissive, easier onboarding)
+    outboundTrafficPolicy:
+      mode: REGISTRY_ONLY
+
+    # Enable Prometheus metrics scraping via /stats/prometheus
+    enablePrometheusMerge: true
+
+  # Component-level overrides
+  components:
+    # istiod (Pilot): control plane
+    pilot:
+      enabled: true
+      k8s:
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+        hpaSpec:
+          minReplicas: 2      # HA: at least 2 replicas in prod
+          maxReplicas: 5
+          metrics:
+            - type: Resource
+              resource:
+                name: cpu
+                target:
+                  type: Utilization
+                  averageUtilization: 80
+        # Pod disruption budget: ensure at least 1 replica during rolling update
+        podDisruptionBudget:
+          minAvailable: 1
+        env:
+          # Reduce sidecar injection webhook timeout (default 10s)
+          - name: INJECTION_WEBHOOK_CONFIG_NAME
+            value: istio-sidecar-injector
+
+    # Ingress gateway (exposed as LoadBalancer Service)
+    ingressGateways:
+      - name: istio-ingressgateway
+        enabled: true
+        k8s:
+          service:
+            type: LoadBalancer
+            ports:
+              - name: http2
+                port: 80
+                targetPort: 8080
+              - name: https
+                port: 443
+                targetPort: 8443
+              - name: tcp
+                port: 31400
+                targetPort: 31400
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 2000m
+              memory: 1Gi
+          hpaSpec:
+            minReplicas: 2
+            maxReplicas: 10
+
+    # Egress gateway: control and audit outbound traffic
+    egressGateways:
+      - name: istio-egressgateway
+        enabled: true
+        k8s:
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+
+  # Global values shared across all components
+  values:
+    global:
+      # Proxy (Envoy sidecar) resource defaults
+      proxy:
+        resources:
+          requests:
+            cpu: 10m
+            memory: 40Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        # Log level for Envoy sidecars: trace|debug|info|warning|error|critical|off
+        logLevel: warning
+        # Component-level log overrides (useful for debugging specific subsystems)
+        componentLogLevel: "misc:error"
+
+      # Enable Prometheus metrics
+      proxy_init:
+        resources:
+          limits:
+            cpu: 100m
+            memory: 50Mi
+
+    # Pilot-specific values
+    pilot:
+      autoscaleEnabled: true
+      traceSampling: 1.0    # percent, override per meshConfig above for consistency
+
+    # Sidecar injector
+    sidecarInjectorWebhook:
+      enableNamespacesByDefault: false  # opt-in via label: istio-injection=enabled
+      rewriteAppHTTPProbe: true         # rewrite liveness/readiness probes to go through sidecar

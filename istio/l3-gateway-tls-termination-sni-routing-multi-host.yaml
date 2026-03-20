@@ -1,0 +1,200 @@
+# Istio L3 — Gateway TLS termination, SNI-based routing, multi-host ingress
+# Demonstrates: Gateway resource, TLS termination, HTTPS redirect, SNI passthrough,
+#               multi-host routing, wildcard certs, cross-namespace VirtualService binding
+#
+# Apply: kubectl apply -f l3-gateway-tls-termination-sni-routing-multi-host.yaml
+# Prereq: TLS secret in istio-system namespace:
+#   kubectl -n istio-system create secret tls example-tls \
+#     --cert=fullchain.pem --key=privkey.pem
+
+---
+# ── Gateway: HTTP → HTTPS redirect ───────────────────────────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: http-redirect-gateway
+  namespace: istio-system
+spec:
+  selector:
+    istio: ingressgateway     # targets the istio-ingressgateway pod
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "*.example.com"
+        - "example.com"
+      # Redirect all HTTP to HTTPS
+      tls:
+        httpsRedirect: true
+
+---
+# ── Gateway: HTTPS TLS termination for multiple hosts ────────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: https-gateway
+  namespace: istio-system
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    # ── Server 1: app.example.com — terminate TLS with stored secret ──────────
+    - port:
+        number: 443
+        name: https-app
+        protocol: HTTPS
+      hosts:
+        - "production/app.example.com"   # namespace/host — binds to VirtualService in production ns
+      tls:
+        mode: SIMPLE                     # TLS termination (Istio handles the cert)
+        credentialName: app-example-tls  # K8s Secret in istio-system
+
+    # ── Server 2: wildcard *.api.example.com — wildcard cert ─────────────────
+    - port:
+        number: 443
+        name: https-api
+        protocol: HTTPS
+      hosts:
+        - "production/*.api.example.com"
+      tls:
+        mode: SIMPLE
+        credentialName: wildcard-api-example-tls
+
+    # ── Server 3: internal.example.com — mTLS (client cert required) ─────────
+    - port:
+        number: 443
+        name: https-internal-mtls
+        protocol: HTTPS
+      hosts:
+        - "internal/internal.example.com"
+      tls:
+        mode: MUTUAL                     # require client certificate
+        credentialName: internal-mtls-certs
+        # subjectAltNames: restrict which client certs are accepted
+        # subjectAltNames:
+        #   - "spiffe://cluster.local/ns/default/sa/trusted-service"
+
+---
+# ── Gateway: SNI passthrough — TLS not terminated, routed by SNI ─────────────
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: tls-passthrough-gateway
+  namespace: istio-system
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 443
+        name: tls-passthrough
+        protocol: TLS
+      hosts:
+        - "production/db.example.com"
+      tls:
+        mode: PASSTHROUGH    # SNI routing — Envoy does NOT terminate TLS
+
+---
+# ── VirtualService: app.example.com routing (bound to https-gateway) ─────────
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: app-virtualservice
+  namespace: production
+spec:
+  hosts:
+    - app.example.com
+  gateways:
+    - istio-system/https-gateway
+    - mesh                           # also apply for in-mesh east-west traffic
+  http:
+    - name: app-routing
+      match:
+        - uri:
+            prefix: /api/
+      route:
+        - destination:
+            host: api-service.production.svc.cluster.local
+            port:
+              number: 8080
+      timeout: 10s
+      retries:
+        attempts: 3
+        perTryTimeout: 3s
+        retryOn: "5xx,connect-failure"
+
+    - name: app-default
+      route:
+        - destination:
+            host: app-service.production.svc.cluster.local
+            port:
+              number: 3000
+
+---
+# ── VirtualService: SNI passthrough for db.example.com ───────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: db-passthrough-virtualservice
+  namespace: production
+spec:
+  hosts:
+    - db.example.com
+  gateways:
+    - istio-system/tls-passthrough-gateway
+  tls:
+    # Route based on SNI — no TLS termination
+    - match:
+        - port: 443
+          sniHosts:
+            - db.example.com
+      route:
+        - destination:
+            host: postgres.production.svc.cluster.local
+            port:
+              number: 5432
+
+---
+# ── VirtualService: wildcard API subdomain routing ────────────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: api-wildcard-virtualservice
+  namespace: production
+spec:
+  hosts:
+    - "*.api.example.com"
+  gateways:
+    - istio-system/https-gateway
+  http:
+    # Route v1.api.example.com → api-v1 service
+    - name: api-v1
+      match:
+        - authority:
+            prefix: "v1.api"
+      route:
+        - destination:
+            host: api-v1-service.production.svc.cluster.local
+            port:
+              number: 8080
+
+    # Route v2.api.example.com → api-v2 service
+    - name: api-v2
+      match:
+        - authority:
+            prefix: "v2.api"
+      route:
+        - destination:
+            host: api-v2-service.production.svc.cluster.local
+            port:
+              number: 8080
+
+    # Default: latest stable
+    - name: api-default
+      route:
+        - destination:
+            host: api-v2-service.production.svc.cluster.local
+            port:
+              number: 8080

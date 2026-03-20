@@ -1,0 +1,188 @@
+# Istio L4 — AuthorizationPolicy, PeerAuthentication (mTLS), RBAC
+# Demonstrates: namespace-wide mTLS enforcement, service-level RBAC,
+#               JWT end-user authentication, deny-by-default, allow-listing
+#
+# Apply: kubectl apply -f l4-authorization-policy-mtls-peer-authentication-rbac.yaml
+
+---
+# ── PeerAuthentication: enforce strict mTLS namespace-wide ───────────────────
+# All pods in 'production' namespace must use mTLS for inbound traffic.
+# Sidecars that haven't migrated yet: set mode: PERMISSIVE on their own PA.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: production-strict-mtls
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT    # STRICT | PERMISSIVE | DISABLE
+
+---
+# ── PeerAuthentication: per-workload override (legacy service still migrating) ─
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: legacy-service-permissive-mtls
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: legacy-service    # only this workload
+  mtls:
+    mode: PERMISSIVE         # allow both plain and mTLS until migration complete
+  # Per-port overrides (e.g., metrics port doesn't need mTLS)
+  portLevelMtls:
+    9090:
+      mode: DISABLE          # Prometheus scrapes metrics without mTLS
+
+---
+# ── AuthorizationPolicy: deny all by default (zero-trust baseline) ────────────
+# An empty spec with action DENY and no rules denies nothing;
+# a missing AuthorizationPolicy allows everything.
+# The pattern for zero-trust: one DENY-all + explicit ALLOW policies.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all-default
+  namespace: production
+spec:
+  {}   # empty spec = deny all traffic to all workloads in this namespace
+
+---
+# ── AuthorizationPolicy: allow ingress gateway to reach app-service ───────────
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ingress-to-app
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: app-service
+  action: ALLOW
+  rules:
+    - from:
+        # Only the ingress gateway's service account may call this service
+        - source:
+            principals:
+              - "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
+      to:
+        - operation:
+            methods: ["GET", "POST"]
+            ports: ["3000"]
+
+---
+# ── AuthorizationPolicy: service-to-service RBAC ─────────────────────────────
+# api-service may call reviews-service; nothing else can
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: reviews-allow-api-service
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: reviews
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            # Match by SPIFFE identity (mTLS peer cert)
+            principals:
+              - "cluster.local/ns/production/sa/api-service"
+        - source:
+            # Also allow from staging namespace for integration tests
+            namespaces: ["staging"]
+      to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/api/reviews*"]
+            ports: ["8080"]
+      when:
+        # Condition: only allow if request has valid header
+        - key: request.headers[x-internal-token]
+          values: ["allowed"]
+
+---
+# ── AuthorizationPolicy: JWT end-user authentication ─────────────────────────
+# Validates JWT from Authorization: Bearer <token> header
+# Requires RequestAuthentication to be defined first (see below)
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: require-jwt-for-api
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: api-service
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            # requestPrincipals: extracted from validated JWT sub claim
+            requestPrincipals: ["*"]   # any valid JWT principal
+      to:
+        - operation:
+            methods: ["GET", "POST", "PUT", "DELETE"]
+      when:
+        # Require specific JWT claim (role = admin for write operations)
+        - key: request.auth.claims[role]
+          values: ["admin", "editor", "viewer"]
+
+---
+# ── RequestAuthentication: define valid JWT issuers ──────────────────────────
+# Must be defined alongside AuthorizationPolicy that checks requestPrincipals
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: api-jwt-auth
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: api-service
+  jwtRules:
+    # Primary issuer: internal Auth service
+    - issuer: "https://auth.example.com"
+      jwksUri: "https://auth.example.com/.well-known/jwks.json"
+      audiences:
+        - "api.example.com"
+      # Cache JWKS for 5 minutes (reduce latency)
+      jwksRefreshInterval: 300s
+      # Forward validated JWT to backend (for logging/audit)
+      forwardOriginalToken: true
+      # Claim that becomes the request principal
+      outputClaimToHeaders:
+        - header: x-jwt-sub
+          claim: sub
+        - header: x-jwt-role
+          claim: role
+
+    # Secondary issuer: third-party OAuth provider
+    - issuer: "https://accounts.google.com"
+      jwksUri: "https://www.googleapis.com/oauth2/v3/certs"
+      audiences:
+        - "your-google-client-id.apps.googleusercontent.com"
+
+---
+# ── AuthorizationPolicy: admin namespace full access for ops team ─────────────
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ops-namespace-full-access
+  namespace: production
+spec:
+  # No selector = applies to all workloads in namespace
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: ["ops", "monitoring"]
+            principals:
+              - "cluster.local/ns/ops/sa/prometheus"
+              - "cluster.local/ns/monitoring/sa/grafana"
+      to:
+        - operation:
+            # Allow metrics scraping on any port
+            paths: ["/metrics", "/stats/prometheus"]

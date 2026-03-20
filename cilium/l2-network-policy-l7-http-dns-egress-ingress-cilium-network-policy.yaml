@@ -1,0 +1,209 @@
+# Cilium L2 — CiliumNetworkPolicy: L7 HTTP rules, DNS egress, ingress/egress RBAC
+# Demonstrates: L3/L4/L7 policies, DNS-based egress, entity selectors,
+#               HTTP method/path rules, toFQDNs, namespace selectors
+#
+# Apply: kubectl apply -f l2-network-policy-l7-http-dns-egress-ingress-cilium-network-policy.yaml
+# Prereq: Cilium installed with L7 proxy enabled (default)
+
+---
+# ── CiliumNetworkPolicy: api-service — full L3/L4/L7 policy ──────────────────
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: api-service-network-policy
+  namespace: production
+spec:
+  # Select workload this policy applies to
+  endpointSelector:
+    matchLabels:
+      app: api-service
+
+  # ── INGRESS rules ─────────────────────────────────────────────────────────
+  ingress:
+    # Allow HTTP from frontend pods in same namespace
+    - fromEndpoints:
+        - matchLabels:
+            app: frontend
+            io.kubernetes.pod.namespace: production
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+          rules:
+            http:
+              # L7 HTTP rules: restrict methods and paths
+              - method: GET
+                path: /api/users(/.*)?
+              - method: POST
+                path: /api/users
+              - method: PUT
+                path: /api/users/[^/]+
+              - method: DELETE
+                path: /api/users/[^/]+
+                # Require specific header for DELETE (extra safety)
+                headers:
+                  - X-Confirm-Delete: "true"
+
+    # Allow health checks from kube-system (kubelet probes via node IP)
+    - fromEntities:
+        - host           # the node itself (kubelet)
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+          rules:
+            http:
+              - method: GET
+                path: /health
+
+    # Allow Prometheus scraping from monitoring namespace
+    - fromEndpoints:
+        - matchLabels:
+            app: prometheus
+            io.kubernetes.pod.namespace: monitoring
+      toPorts:
+        - ports:
+            - port: "9090"
+              protocol: TCP
+
+    # Allow ingress from Cilium's Hubble relay (observability)
+    - fromEntities:
+        - cluster
+
+  # ── EGRESS rules ──────────────────────────────────────────────────────────
+  egress:
+    # Allow DNS resolution (required for service discovery)
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              # Allow DNS queries for internal cluster services
+              - matchPattern: "*.cluster.local"
+              - matchPattern: "*.production.svc.cluster.local"
+              # Allow specific external domains (allowlist)
+              - matchName: "api.stripe.com"
+              - matchName: "api.sendgrid.com"
+              - matchPattern: "*.amazonaws.com"
+
+    # Allow calls to reviews-service (L7 HTTP restricted)
+    - toEndpoints:
+        - matchLabels:
+            app: reviews-service
+            io.kubernetes.pod.namespace: production
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+          rules:
+            http:
+              - method: GET
+                path: /reviews(/.*)?
+
+    # Allow calls to external payment API via FQDN
+    - toFQDNs:
+        - matchName: "api.stripe.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+
+    # Allow calls to S3 (wildcard FQDN)
+    - toFQDNs:
+        - matchPattern: "*.s3.amazonaws.com"
+        - matchPattern: "s3.*.amazonaws.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+
+    # Allow Kubernetes API server access (for service account token validation)
+    - toEntities:
+        - kube-apiserver
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "6443"
+              protocol: TCP
+
+---
+# ── CiliumNetworkPolicy: default deny all in namespace (zero-trust baseline) ──
+# Apply this FIRST, then layer allow policies on top.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  # Empty endpointSelector = applies to ALL pods in namespace
+  endpointSelector: {}
+  ingress:
+    - {}    # deny all ingress (empty rule = no match = deny)
+  egress:
+    # Always allow DNS (otherwise nothing works)
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+
+---
+# ── CiliumClusterwideNetworkPolicy: node-level firewall ──────────────────────
+# Cluster-scoped (not namespaced) — applies to host network stack.
+# Requires hostFirewall.enabled=true in Cilium Helm values.
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: node-ingress-allow-ssh-api
+spec:
+  # Targets the node itself (not pods)
+  nodeSelector:
+    matchLabels:
+      kubernetes.io/os: linux
+  ingress:
+    # Allow SSH only from bastion subnet
+    - fromCIDR:
+        - 10.0.100.0/24    # bastion host CIDR
+      toPorts:
+        - ports:
+            - port: "22"
+              protocol: TCP
+
+    # Allow K8s API from all cluster nodes
+    - fromEntities:
+        - cluster
+      toPorts:
+        - ports:
+            - port: "6443"
+              protocol: TCP
+            - port: "2379"    # etcd
+              protocol: TCP
+            - port: "2380"    # etcd peer
+              protocol: TCP
+
+    # Allow kubelet API from cluster nodes
+    - fromEntities:
+        - cluster
+      toPorts:
+        - ports:
+            - port: "10250"
+              protocol: TCP
+
+  egress:
+    # Allow all egress from nodes (restrict further as needed)
+    - toEntities:
+        - world
+        - cluster

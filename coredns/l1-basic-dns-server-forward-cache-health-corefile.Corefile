@@ -1,0 +1,89 @@
+# CoreDNS L1 — Basic DNS Server: forward, cache, health, log, errors
+# Demonstrates: zone definitions, forwarding to upstream resolvers,
+#               response caching, health endpoint, metrics
+#
+# Usage:
+#   docker run --rm -v $(pwd)/l1-basic-dns-server-forward-cache-health-corefile.Corefile:/Corefile:ro \
+#     -p 53:53/udp -p 53:53/tcp -p 9153:9153 coredns/coredns:latest
+#
+# Test:
+#   dig @127.0.0.1 example.com
+#   dig @127.0.0.1 -p 53 google.com A
+
+# ── Root zone: handle all queries ────────────────────────────────────────────
+. {
+    # Forward unresolved queries to upstream resolvers
+    # prefer_udp: try UDP first, fall back to TCP
+    # health_check: CoreDNS monitors upstreams and stops forwarding to dead ones
+    forward . 1.1.1.1 8.8.8.8 8.8.4.4 {
+        prefer_udp
+        health_check 5s
+        max_fails 3
+        expire 10s
+        policy round_robin          # round_robin | random | sequential
+    }
+
+    # Cache DNS responses to reduce upstream load
+    # ttl: max cache TTL (clamps response TTL if lower)
+    # success: positive response cache size (number of entries)
+    # denial: negative response (NXDOMAIN) cache size
+    cache 300 {
+        success 10000
+        denial  5000
+        prefetch 10 1m 10%          # prefetch entries accessed >10x/min when TTL < 10%
+    }
+
+    # Health endpoint at http://<host>:8080/health
+    health :8080
+
+    # Prometheus metrics at http://<host>:9153/metrics
+    prometheus :9153
+
+    # Log all queries (format: combined includes latency + response code)
+    log . {
+        class all
+    }
+
+    # Surface errors in logs instead of silently dropping
+    errors
+
+    # Reload Corefile on change without restart (checks every 30s)
+    reload 30s
+}
+
+# ── Internal zone: authoritative for internal.example.com ────────────────────
+# Serves records from inline zone data (no external zone file needed for simple cases)
+internal.example.com:53 {
+    # Serve authoritative records for this zone
+    # For production, use 'file /etc/coredns/zones/internal.example.com.zone'
+    # Inline records via 'hosts' plugin:
+    hosts {
+        10.0.1.10   api.internal.example.com
+        10.0.1.11   auth.internal.example.com
+        10.0.1.12   db.internal.example.com
+        10.0.1.20   cache.internal.example.com
+        fallthrough
+    }
+
+    # Cache internal zone responses
+    cache 60
+
+    # Log only errors for internal zone (reduce noise)
+    log . {
+        class error
+    }
+
+    errors
+}
+
+# ── Local development zone: .localhost ────────────────────────────────────────
+localhost:53 {
+    hosts {
+        127.0.0.1 whoami.localhost
+        127.0.0.1 api.localhost
+        127.0.0.1 traefik.localhost
+        fallthrough
+    }
+    cache 30
+    errors
+}

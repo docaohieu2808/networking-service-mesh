@@ -1,0 +1,187 @@
+# Cilium L1 — Helm install values: kube-proxy replacement, Hubble observability
+# Demonstrates: kube-proxy replacement, eBPF host routing, Hubble UI + relay,
+#               Prometheus metrics, IPAM config, encryption, cluster mesh prep
+#
+# Install:
+#   helm repo add cilium https://helm.cilium.io/
+#   helm repo update
+#   helm install cilium cilium/cilium \
+#     --namespace kube-system \
+#     --version 1.15.0 \
+#     -f l1-install-helm-values-kubeproxy-replacement-hubble-enabled.yaml
+#
+# Verify:
+#   cilium status --wait
+#   cilium connectivity test
+
+# ── kube-proxy replacement (eBPF-native, removes kube-proxy DaemonSet) ────────
+kubeProxyReplacement: true         # true | false | partial
+# API server address (required when kubeProxyReplacement=true and no kube-proxy)
+k8sServiceHost: 10.0.0.1          # replace with your API server IP or hostname
+k8sServicePort: 6443
+
+# ── IPAM: IP address management ───────────────────────────────────────────────
+ipam:
+  mode: kubernetes                 # kubernetes | cluster-pool | eni (AWS) | azure | alibabacloud
+  # cluster-pool mode: Cilium manages pod CIDRs
+  # operator:
+  #   clusterPoolIPv4PodCIDRList: ["10.0.0.0/8"]
+  #   clusterPoolIPv4MaskSize: 24
+
+# Pod CIDR (must not overlap with node/service CIDRs)
+# ipv4NativeRoutingCIDR: "10.0.0.0/8"
+
+# ── eBPF host routing: bypass iptables entirely ───────────────────────────────
+routingMode: native                # native (eBPF) | tunnel (vxlan/geneve)
+# For tunnel mode:
+# tunnelProtocol: vxlan            # vxlan | geneve
+
+# Direct server return: reply packets skip host network stack
+autoDirectNodeRoutes: true
+enableIPv4Masquerade: true
+bpfMasquerade: true               # eBPF-based masquerade (faster than iptables)
+
+# ── BPF settings ──────────────────────────────────────────────────────────────
+bpf:
+  masquerade: true
+  # CT table sizes (increase for high connection rate clusters)
+  ctTcpMax: 524288
+  ctAnyMax: 262144
+  # LB algorithm: maglev | random
+  lbAlgorithm: maglev
+  # Enable socket-level load balancing (bypass kube-proxy iptables NAT)
+  hostLegacyRouting: false
+
+# ── LoadBalancer acceleration ─────────────────────────────────────────────────
+loadBalancer:
+  acceleration: native             # native (XDP) | disabled
+  mode: dsr                        # dsr (Direct Server Return) | snat | hybrid
+  # DSR requires routable pod IPs (native routing mode)
+
+# ── Hubble: eBPF-based network observability ──────────────────────────────────
+hubble:
+  enabled: true
+
+  # Hubble relay: aggregates data from all nodes
+  relay:
+    enabled: true
+    replicas: 2
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+
+  # Hubble UI: web dashboard for flow visualization
+  ui:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+
+  # Metrics exported to Prometheus (scraped from :9965/metrics on each node)
+  metrics:
+    enabled:
+      - dns:query;ignoreAAAA
+      - drop
+      - tcp
+      - flow
+      - port-distribution
+      - icmp
+      - http
+      - "flow:sourceContext=workload-name|reserved-identity;destinationContext=workload-name|reserved-identity"
+    serviceMonitor:
+      enabled: true                # create Prometheus ServiceMonitor CRs
+
+  # TLS for Hubble relay
+  tls:
+    enabled: true
+    auto:
+      enabled: true
+      method: certmanager          # certmanager | helm | cronJob
+      certManagerIssuerRef:
+        name: ca-issuer
+        kind: ClusterIssuer
+        group: cert-manager.io
+
+# ── Prometheus metrics (Cilium agent) ────────────────────────────────────────
+prometheus:
+  enabled: true
+  port: 9962
+  serviceMonitor:
+    enabled: true
+
+operator:
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+
+# ── Encryption: transparent pod-to-pod encryption ────────────────────────────
+encryption:
+  enabled: false                   # set true to enable
+  type: wireguard                  # wireguard | ipsec
+  # WireGuard: kernel 5.6+, no key management needed (auto per-node keys)
+  # IPsec: requires manual key rotation or cert-manager integration
+  nodeEncryption: false            # encrypt node-to-node traffic too (not just pod-to-pod)
+
+# ── Cluster mesh: multi-cluster service discovery ─────────────────────────────
+# clustermesh:
+#   useAPIServer: true
+#   apiserver:
+#     replicas: 2
+#     service:
+#       type: LoadBalancer
+
+# ── Control plane resources ───────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    cpu: 4000m
+    memory: 4Gi
+
+operator:
+  replicas: 2                      # HA operator
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+# ── Feature flags ─────────────────────────────────────────────────────────────
+enableIPv6: false
+hostFirewall:
+  enabled: false                   # eBPF-based host-level firewall (node policies)
+
+# Enable bandwidth manager (eBPF-based egress QoS / rate limiting)
+bandwidthManager:
+  enabled: true
+  bbr: true                        # use BBR congestion control algorithm
+
+# ── SecurityContext (required for eBPF on some distros) ─────────────────────
+securityContext:
+  capabilities:
+    ciliumAgent:
+      - CHOWN
+      - KILL
+      - NET_ADMIN
+      - NET_RAW
+      - IPC_LOCK
+      - SYS_ADMIN
+      - SYS_RESOURCE
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    cleanCiliumState:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - SYS_RESOURCE

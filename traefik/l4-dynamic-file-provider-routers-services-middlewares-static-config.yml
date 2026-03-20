@@ -1,0 +1,153 @@
+# Traefik L4 — Dynamic File Provider: Routers, Services, Middlewares via static files
+# Demonstrates: file provider, dynamic config hot-reload, TCP/UDP routing, custom headers
+# Usage: docker compose -f l4-dynamic-file-provider-routers-services-middlewares-static-config.yml up -d
+#
+# Traefik watches /config/dynamic/ for *.yml changes and hot-reloads without restart.
+# Mount this directory with your dynamic config files (see inline examples below).
+
+version: "3.9"
+
+services:
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik-l4
+    restart: unless-stopped
+    command:
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.tcp-custom.address=:9000/tcp"
+
+      # Docker provider for container auto-discovery
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      - "--providers.docker.network=traefik_net"
+
+      # File provider — watch entire directory for dynamic configs
+      - "--providers.file.directory=/config/dynamic"
+      - "--providers.file.watch=true"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+      - "9000:9000"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./dynamic:/config/dynamic:ro"   # mount your dynamic config directory
+    networks:
+      - traefik_net
+
+  backend-a:
+    image: traefik/whoami
+    container_name: backend-a
+    restart: unless-stopped
+    networks:
+      - traefik_net
+
+  backend-b:
+    image: traefik/whoami
+    container_name: backend-b
+    restart: unless-stopped
+    networks:
+      - traefik_net
+
+networks:
+  traefik_net:
+    name: traefik_net
+    driver: bridge
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EXAMPLE dynamic config file: ./dynamic/http-routers-services.yml
+# Traefik reloads this automatically on change.
+# ──────────────────────────────────────────────────────────────────────────────
+# http:
+#   middlewares:
+#     secure-headers:
+#       headers:
+#         frameDeny: true
+#         contentTypeNosniff: true
+#         browserXssFilter: true
+#         referrerPolicy: "strict-origin-when-cross-origin"
+#         customResponseHeaders:
+#           X-Robots-Tag: "noindex,nofollow,nosnippet,noarchive,notranslate,noimageindex"
+#           Server: ""                        # hide server token
+#         stsSeconds: 31536000
+#         stsIncludeSubdomains: true
+#         stsPreload: true
+#
+#     compress-gzip:
+#       compress:
+#         excludedContentTypes:
+#           - text/event-stream
+#
+#   routers:
+#     backend-a:
+#       entryPoints: [web]
+#       rule: "Host(`a.localhost`)"
+#       service: svc-backend-a
+#       middlewares: [secure-headers, compress-gzip]
+#
+#     backend-b:
+#       entryPoints: [web]
+#       rule: "Host(`b.localhost`) && PathPrefix(`/api`)"
+#       service: svc-backend-b
+#
+#   services:
+#     svc-backend-a:
+#       loadBalancer:
+#         healthCheck:
+#           path: /health
+#           interval: 10s
+#           timeout: 3s
+#         servers:
+#           - url: "http://backend-a:80"
+#           - url: "http://backend-a:80"   # second replica
+#         sticky:
+#           cookie:
+#             name: lb_session
+#             secure: true
+#             httpOnly: true
+#
+#     svc-backend-b:
+#       loadBalancer:
+#         passHostHeader: true
+#         servers:
+#           - url: "http://backend-b:80"
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# EXAMPLE dynamic config file: ./dynamic/tcp-router.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# tcp:
+#   routers:
+#     postgres-passthrough:
+#       entryPoints: [tcp-custom]
+#       rule: "HostSNI(`*`)"       # HostSNI(`db.example.com`) for TLS passthrough
+#       service: svc-postgres
+#
+#   services:
+#     svc-postgres:
+#       loadBalancer:
+#         servers:
+#           - address: "postgres:5432"
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# EXAMPLE dynamic config file: ./dynamic/tls-options.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# tls:
+#   options:
+#     hardened:
+#       minVersion: VersionTLS12
+#       maxVersion: VersionTLS13
+#       cipherSuites:
+#         - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+#         - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+#         - TLS_AES_256_GCM_SHA384
+#         - TLS_CHACHA20_POLY1305_SHA256
+#       curvePreferences:
+#         - CurveP521
+#         - CurveP384
+#       sniStrict: true

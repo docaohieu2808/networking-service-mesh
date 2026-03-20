@@ -1,0 +1,192 @@
+# Linkerd L2 — ServiceProfile: per-route retries, timeouts, traffic policy
+# Demonstrates: ServiceProfile CRD, route definitions, retry budgets,
+#               HTTPRoute (Gateway API), Server + AuthorizationPolicy (policy.linkerd.io)
+#
+# Apply: kubectl apply -f l2-service-profile-retry-timeout-per-route-traffic-policy.yaml
+# Prereq: Linkerd control plane installed, namespace injection enabled
+
+---
+# ── ServiceProfile: per-route observability + retry/timeout config ────────────
+# Linkerd uses ServiceProfile to classify requests into named routes,
+# enabling per-route golden metrics (success rate, latency, RPS) in linkerd-viz.
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: api-service.production.svc.cluster.local
+  namespace: production        # must be in the CLIENT namespace (caller side)
+spec:
+  # Routes define how to classify inbound/outbound requests
+  routes:
+    # ── GET /api/users — read endpoint, safe to retry ─────────────────────────
+    - name: GET /api/users
+      condition:
+        method: GET
+        pathRegex: /api/users(/.*)?
+      # Timeout for this specific route (overrides global proxy timeout)
+      timeout: 5s
+      # Retries: only safe for idempotent requests (GET, HEAD)
+      isRetryable: true
+
+    # ── GET /api/users/{id} — single resource fetch ───────────────────────────
+    - name: GET /api/users/{id}
+      condition:
+        method: GET
+        pathRegex: /api/users/[^/]+$
+      timeout: 3s
+      isRetryable: true
+
+    # ── POST /api/users — write endpoint, NOT retryable (avoid duplicate writes)
+    - name: POST /api/users
+      condition:
+        method: POST
+        pathRegex: /api/users
+      timeout: 10s
+      isRetryable: false       # explicit: never retry POST
+
+    # ── GET /api/reports — slow report generation, longer timeout ────────────
+    - name: GET /api/reports
+      condition:
+        method: GET
+        pathRegex: /api/reports(/.*)?
+      timeout: 30s
+      isRetryable: true
+
+    # ── /health — exclude from metrics to reduce noise ────────────────────────
+    - name: GET /health
+      condition:
+        method: GET
+        pathRegex: /health(z)?
+      timeout: 2s
+      isRetryable: false
+
+  # Retry budget: limits total retry load to prevent retry storms
+  # retryBudget applies to ALL retryable routes combined
+  retryBudget:
+    retryRatio: 0.2            # allow up to 20% of requests to be retries
+    minRetriesPerSecond: 10    # always allow at least 10 retries/s (for low-traffic)
+    ttl: 10s                   # sliding window for ratio calculation
+
+---
+# ── ServiceProfile: for a downstream dependency (outbound profile) ────────────
+# When api-service calls reviews-service, this profile applies on the client side.
+# Place in the CALLER's namespace to control outbound traffic shape.
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: reviews-service.production.svc.cluster.local
+  namespace: production
+spec:
+  routes:
+    - name: GET /reviews
+      condition:
+        method: GET
+        pathRegex: /reviews(/.*)?
+      timeout: 3s
+      isRetryable: true
+
+    - name: POST /reviews
+      condition:
+        method: POST
+        pathRegex: /reviews
+      timeout: 8s
+      isRetryable: false
+
+  retryBudget:
+    retryRatio: 0.15
+    minRetriesPerSecond: 5
+    ttl: 10s
+
+---
+# ── Server: define inbound policy for api-service (Linkerd policy API) ────────
+# Server selects which pods + port are governed by this policy.
+# Requires Linkerd >= 2.12 and policy controller.
+apiVersion: policy.linkerd.io/v1beta3
+kind: Server
+metadata:
+  name: api-service-http
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  port: 8080
+  proxyProtocol: HTTP/2     # HTTP/1, HTTP/2, gRPC, opaque, TLS, unknown
+
+---
+# ── AuthorizationPolicy: allow only specific clients to reach api-service ─────
+apiVersion: policy.linkerd.io/v1alpha1
+kind: AuthorizationPolicy
+metadata:
+  name: api-service-allow-frontend
+  namespace: production
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: api-service-http
+  # Allow traffic from these service accounts (mTLS identity)
+  requiredAuthenticationRefs:
+    - name: frontend-sa-authn
+      kind: MeshTLSAuthentication
+      group: policy.linkerd.io
+
+---
+# ── MeshTLSAuthentication: frontend service account identity ─────────────────
+apiVersion: policy.linkerd.io/v1alpha1
+kind: MeshTLSAuthentication
+metadata:
+  name: frontend-sa-authn
+  namespace: production
+spec:
+  identities:
+    # SPIFFE identity of the frontend service account
+    - "*.production.serviceaccount.identity.linkerd.cluster.local"
+  identityRefs:
+    - kind: ServiceAccount
+      name: frontend-service
+      namespace: production
+
+---
+# ── HTTPRoute (Gateway API): fine-grained L7 routing with Linkerd ────────────
+# Linkerd supports Gateway API HTTPRoute for advanced routing (>= 2.13).
+# Requires: kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/...
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: HTTPRoute
+metadata:
+  name: api-service-routes
+  namespace: production
+spec:
+  parentRefs:
+    - name: api-service
+      kind: Service
+      group: core
+      port: 8080
+  rules:
+    # Route /api/v2/* to the v2 backend (canary)
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v2
+      backendRefs:
+        - name: api-service-v2
+          port: 8080
+          weight: 100
+
+    # Route /api/v1/* to stable backend
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1
+      backendRefs:
+        - name: api-service-v1
+          port: 8080
+          weight: 100
+
+    # Default: 90/10 split between stable and canary
+    - backendRefs:
+        - name: api-service-v1
+          port: 8080
+          weight: 90
+        - name: api-service-v2
+          port: 8080
+          weight: 10

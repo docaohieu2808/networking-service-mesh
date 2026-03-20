@@ -1,0 +1,160 @@
+# Linkerd L1 — Install control plane + proxy injection via namespace annotation
+# Demonstrates: Linkerd CRD bootstrap, namespace injection annotation,
+#               Deployment injection, linkerd-viz extension, CNI plugin mode
+#
+# Prerequisites:
+#   linkerd check --pre                    # verify cluster readiness
+#   linkerd install --crds | kubectl apply -f -
+#   linkerd install | kubectl apply -f -   # or use Helm below
+#   linkerd check                          # verify install
+#
+# Helm install (GitOps-friendly):
+#   helm repo add linkerd https://helm.linkerd.io/stable
+#   helm install linkerd-crds linkerd/linkerd-crds -n linkerd --create-namespace
+#   helm install linkerd-control-plane linkerd/linkerd-control-plane \
+#     -n linkerd -f l1-install-inject-control-plane-namespace-annotation.yaml
+#
+# Inject existing deployments:
+#   kubectl get deploy -n production -o yaml | linkerd inject - | kubectl apply -f -
+
+# ── Helm values for linkerd-control-plane chart ───────────────────────────────
+# These values are referenced by the Helm install command above.
+controllerReplicas: 3            # HA control plane (3 replicas of controller)
+enablePodAntiAffinity: true      # spread replicas across nodes
+
+# Proxy defaults injected into every annotated pod
+proxy:
+  resources:
+    cpu:
+      request: 10m
+      limit: 1000m
+    memory:
+      request: 20Mi
+      limit: 250Mi
+  logLevel: warn                 # trace|debug|info|warn|error
+  logFormat: json                # json | plain
+  # Ports to skip proxying (e.g. Prometheus node-exporter, health checks)
+  ignoreInboundPorts: "4191,4190"
+  ignoreOutboundPorts: "25,443,587,1234"
+  # Enable native sidecars (K8s 1.28+ SidecarContainers feature gate)
+  nativeSidecar:
+    enabled: false               # set true when cluster supports it
+
+# Proxy injector webhook configuration
+proxyInjector:
+  namespaceSelector:
+    matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values: [kube-system, cert-manager, linkerd]
+
+# Identity (mTLS certificate management)
+identity:
+  issuer:
+    # Use cert-manager for issuing Linkerd trust anchor (production pattern)
+    # scheme: kubernetes.io/tls
+    # When using linkerd's built-in issuer (dev/testing):
+    scheme: linkerd.io/tls
+    clockSkewAllowance: 20s
+    issuanceLifetime: 24h0m0s
+
+# CNI plugin: avoids NET_ADMIN capability requirement on proxy-init
+# Install separately: helm install linkerd-cni linkerd/linkerd-cni -n linkerd-cni
+cniEnabled: false
+
+---
+# ── Namespace: opt-in to automatic proxy injection ────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  annotations:
+    # linkerd.io/inject: enabled  → auto-inject proxy into all pods in this namespace
+    linkerd.io/inject: enabled
+  labels:
+    # Required for linkerd-viz prometheus scraping
+    linkerd.io/extension: viz
+
+---
+# ── Namespace: explicitly disable injection (e.g. batch jobs, legacy) ─────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: batch-jobs
+  annotations:
+    linkerd.io/inject: disabled
+
+---
+# ── Deployment: explicit per-pod injection annotations ────────────────────────
+# Use when namespace-level injection is disabled or needs override
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-service
+  template:
+    metadata:
+      labels:
+        app: api-service
+      annotations:
+        # Inject proxy into this pod (overrides namespace setting)
+        linkerd.io/inject: enabled
+
+        # Per-pod proxy resource override
+        config.linkerd.io/proxy-cpu-request: "20m"
+        config.linkerd.io/proxy-memory-request: "32Mi"
+        config.linkerd.io/proxy-cpu-limit: "500m"
+        config.linkerd.io/proxy-memory-limit: "128Mi"
+
+        # Skip outbound proxying for specific ports (e.g. Kafka, Redis)
+        config.linkerd.io/skip-outbound-ports: "6379,9092"
+
+        # Skip inbound proxying for health-check port (avoids probe rewriting)
+        config.linkerd.io/skip-inbound-ports: "9090"
+
+        # Proxy log level override for this pod only
+        config.linkerd.io/proxy-log-level: "linkerd=info,warn"
+    spec:
+      containers:
+        - name: api-service
+          image: example/api-service:latest
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 9090
+              name: metrics
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+
+---
+# ── linkerd-viz extension install (dashboard + Prometheus + Grafana) ──────────
+# Run after control plane is healthy:
+#   linkerd viz install | kubectl apply -f -
+# Or via Helm:
+#   helm install linkerd-viz linkerd/linkerd-viz -n linkerd-viz --create-namespace \
+#     --set dashboard.replicas=2 \
+#     --set prometheusUrl=""           # use external Prometheus
+#
+# Access dashboard (port-forward):
+#   linkerd viz dashboard &
+#
+# Tap live traffic:
+#   linkerd viz tap deploy/api-service -n production
+#
+# Top (golden metrics per route):
+#   linkerd viz top deploy/api-service -n production

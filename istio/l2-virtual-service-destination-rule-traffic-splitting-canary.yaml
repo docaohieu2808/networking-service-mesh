@@ -1,0 +1,175 @@
+# Istio L2 — VirtualService + DestinationRule: traffic splitting, canary, retries, timeouts
+# Demonstrates: weighted routing, header-based routing, fault injection,
+#               connection pool tuning, outlier detection, canary deployments
+#
+# Apply: kubectl apply -f l2-virtual-service-destination-rule-traffic-splitting-canary.yaml
+# Prereq: namespace labeled with istio-injection=enabled
+
+---
+# ── DestinationRule: define subsets (versions) and connection policy ──────────
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: reviews-destination-rule
+  namespace: production
+spec:
+  host: reviews.production.svc.cluster.local
+
+  # Traffic policy applies to all subsets unless overridden
+  trafficPolicy:
+    # Connection pool: limits concurrent connections/requests to each pod
+    connectionPool:
+      tcp:
+        maxConnections: 100          # max TCP connections per host
+        connectTimeout: 5s
+        tcpKeepalive:
+          time: 7200s
+          interval: 75s
+      http:
+        http1MaxPendingRequests: 1000
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 0  # 0 = unlimited (use keepalive)
+        maxRetries: 3
+        idleTimeout: 90s
+        h2UpgradePolicy: UPGRADE     # upgrade HTTP/1.1 to HTTP/2 when possible
+
+    # Outlier detection: circuit breaker — eject unhealthy pods from load balancing
+    outlierDetection:
+      consecutive5xxErrors: 5       # eject after 5 consecutive 5xx errors
+      consecutiveGatewayErrors: 3
+      interval: 30s                 # scan interval
+      baseEjectionTime: 30s        # min ejection duration
+      maxEjectionPercent: 50       # never eject more than 50% of pods
+      minHealthPercent: 30         # stop ejecting if fewer than 30% remain healthy
+
+    # Load balancing algorithm
+    loadBalancer:
+      simple: LEAST_REQUEST        # ROUND_ROBIN | LEAST_REQUEST | RANDOM | PASSTHROUGH
+
+  # Subsets map to pod label selectors (version label)
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+      trafficPolicy:
+        loadBalancer:
+          simple: ROUND_ROBIN
+    - name: v2
+      labels:
+        version: v2
+      # v2 gets stricter connection limits during canary
+      trafficPolicy:
+        connectionPool:
+          http:
+            http1MaxPendingRequests: 100
+            http2MaxRequests: 100
+
+---
+# ── VirtualService: routing rules for the reviews service ─────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: reviews-virtual-service
+  namespace: production
+spec:
+  # Applies to requests for this hostname (K8s Service FQDN)
+  hosts:
+    - reviews.production.svc.cluster.local
+    - reviews   # short name within namespace
+
+  # Attach to these Gateways (omit for in-mesh traffic only)
+  # gateways:
+  #   - production/reviews-gateway
+  #   - mesh                         # "mesh" = apply to all sidecar traffic
+
+  http:
+    # ── Rule 1: Header-based routing (internal QA traffic → v2) ──────────────
+    - name: canary-header-routing
+      match:
+        - headers:
+            x-canary:
+              exact: "true"
+        - headers:
+            cookie:
+              regex: ".*canary=1.*"
+      route:
+        - destination:
+            host: reviews.production.svc.cluster.local
+            subset: v2
+          weight: 100
+
+    # ── Rule 2: Weighted canary split (10% to v2, 90% to v1) ─────────────────
+    - name: weighted-canary-split
+      route:
+        - destination:
+            host: reviews.production.svc.cluster.local
+            subset: v1
+          weight: 90
+        - destination:
+            host: reviews.production.svc.cluster.local
+            subset: v2
+          weight: 10
+
+      # Retry policy: retry on 5xx and retriable status codes
+      retries:
+        attempts: 3
+        perTryTimeout: 5s
+        retryOn: "5xx,reset,connect-failure,retriable-4xx"
+        retryRemoteLocalities: true
+
+      # Request timeout (overrides global mesh default)
+      timeout: 15s
+
+      # Fault injection (dev/staging only — disable in production)
+      # fault:
+      #   delay:
+      #     percentage:
+      #       value: 10.0     # inject 500ms delay into 10% of requests
+      #     fixedDelay: 500ms
+      #   abort:
+      #     percentage:
+      #       value: 5.0      # return HTTP 500 for 5% of requests
+      #     httpStatus: 500
+
+---
+# ── VirtualService: cross-namespace routing (api-gateway → production/reviews) ─
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: reviews-external-routing
+  namespace: api-gateway
+spec:
+  hosts:
+    - reviews.production.svc.cluster.local
+  http:
+    # Mirror 10% of traffic to v2 for shadow testing (no impact on response)
+    - name: traffic-mirroring
+      route:
+        - destination:
+            host: reviews.production.svc.cluster.local
+            subset: v1
+          weight: 100
+      mirror:
+        host: reviews.production.svc.cluster.local
+        subset: v2
+      mirrorPercentage:
+        value: 10.0
+
+      timeout: 10s
+      retries:
+        attempts: 2
+        perTryTimeout: 4s
+        retryOn: "5xx,connect-failure"
+
+---
+# ── DestinationRule: mTLS policy for the service ─────────────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: reviews-mtls-policy
+  namespace: production
+spec:
+  host: reviews.production.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL    # use Istio-managed mTLS certs (MUTUAL = bring-your-own)

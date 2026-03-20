@@ -1,0 +1,35 @@
+# Certificates and private keys — never commit
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.der
+acme.json
+
+# Compiled eBPF objects
+*.o
+*.ll
+
+# Editor / OS artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Secrets and env files
+.env
+.env.*
+secrets.yaml
+*-secret.yaml
+blacklist.lst
+scanner-agents.lst
+
+# Traefik dynamic config dir (generated at runtime)
+traefik/dynamic/
+
+# HAProxy generated files
+haproxy/*.lst

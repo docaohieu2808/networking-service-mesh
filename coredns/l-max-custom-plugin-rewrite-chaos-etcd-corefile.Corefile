@@ -1,0 +1,122 @@
+# CoreDNS L-MAX — Custom plugin config: rewrite, chaos, etcd, template, acl, dnssec
+# Demonstrates: query rewriting, DNS chaos (version endpoint), etcd-backed service
+#               discovery, template plugin for pattern-based responses, ACL, DNSSEC signing
+#
+# Usage:
+#   docker run --rm \
+#     -v $(pwd)/l-max-custom-plugin-rewrite-chaos-etcd-corefile.Corefile:/Corefile:ro \
+#     -p 53:53/udp -p 53:53/tcp \
+#     coredns/coredns:latest -plugins   # verify plugins compiled in
+#
+# Note: etcd and dnssec plugins must be compiled into the CoreDNS binary.
+#       Use the coredns/coredns image or build with custom plugin.cfg.
+
+# ── Zone with full plugin stack ───────────────────────────────────────────────
+example.com:53 {
+    errors
+    log
+
+    # ── ACL: block queries from untrusted networks ────────────────────────────
+    # Allow RFC-1918 ranges + localhost; block everything else
+    acl {
+        allow net 127.0.0.0/8
+        allow net 10.0.0.0/8
+        allow net 172.16.0.0/12
+        allow net 192.168.0.0/16
+        block
+    }
+
+    # ── Rewrite: canonical CNAME flattening ──────────────────────────────────
+    # Rewrite query name before processing — useful for migration/aliasing
+    rewrite name www.example.com app.example.com        # rename: www → app
+    rewrite name regex (.*)\.old\.example\.com {1}.example.com  # regex rewrite
+
+    # Rewrite query type: answer A queries for svc as if they were CNAME
+    # rewrite type CNAME A  # (uncomment to flatten CNAME chains)
+
+    # ── Template: synthetic wildcard responses ────────────────────────────────
+    # Any *.dynamic.example.com query returns a computed IP (last octet from label)
+    # Pattern: svc-N.dynamic.example.com → 10.0.0.N
+    template IN A dynamic.example.com {
+        match ^svc-(?P<id>[0-9]+)\.dynamic\.example\.com\.$
+        answer "{{ .Name }} 60 IN A 10.0.0.{{ .Group.id }}"
+        fallthrough
+    }
+
+    # Wildcard catch-all for *.example.com → returns fixed IP
+    template IN A example.com {
+        match "^.*\.example\.com\.$"
+        answer "{{ .Name }} 30 IN A 93.184.216.34"
+        fallthrough
+    }
+
+    # ── etcd: dynamic service registration ───────────────────────────────────
+    # Services register themselves in etcd under /skydns/com/example/
+    # CoreDNS reads and serves them as DNS records (SkyDNS v2 format)
+    etcd example.com {
+        # etcd endpoints (use TLS in production)
+        endpoint http://etcd:2379
+        # Key prefix in etcd where service records are stored
+        path /skydns
+        # Upstream for records not found in etcd
+        upstream 1.1.1.1:53
+        # TLS config (uncomment for production etcd with TLS):
+        # tls /etc/coredns/etcd-client.crt /etc/coredns/etcd-client.key /etc/coredns/etcd-ca.crt
+    }
+
+    # ── DNSSEC: sign responses on-the-fly ────────────────────────────────────
+    # dnssec plugin signs DNS responses with ECDSA P-256 key
+    # Generate key: dnssec-keygen -a ECDSAP256SHA256 -n ZONE example.com
+    dnssec {
+        key file /etc/coredns/keys/Kexample.com.+013+12345
+        # Signature validity window
+        # signatures_validity     14d
+        # signatures_jitter       1h
+        # signatures_refresh      5d
+    }
+
+    cache 60 {
+        success 5000
+        denial  2500
+    }
+
+    prometheus :9153
+    health :8080
+    reload 15s
+}
+
+# ── Chaos: respond to version queries (CoreDNS identity endpoint) ─────────────
+# dig @127.0.0.1 version.bind TXT CHAOS
+# dig @127.0.0.1 version.server TXT CHAOS
+.:53 {
+    # chaos version.bind / version.server → returns custom string
+    chaos "CoreDNS-custom v1.0" info@example.com
+
+    errors
+
+    # ── Rewrite: redirect legacy hostnames before forwarding ──────────────────
+    rewrite name old-api.example.com api.example.com
+
+    # ── Forward with health-checked upstreams and ECS (EDNS Client Subnet) ───
+    forward . 1.1.1.1 8.8.8.8 {
+        prefer_udp
+        health_check 5s
+        max_fails 3
+        expire 15s
+        policy sequential        # try first upstream before failing over
+        # Send EDNS0 Client Subnet for geo-aware CDN responses:
+        # (requires upstream support)
+    }
+
+    cache 300 {
+        success 10000
+        denial  5000
+        prefetch 10 1m 10%
+    }
+
+    # Loop guard
+    loop
+
+    prometheus :9153
+    reload 30s
+}
