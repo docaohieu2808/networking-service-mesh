@@ -46,17 +46,18 @@ spec:
 
     # Enable distributed tracing (Zipkin-compatible endpoint)
     enableTracing: true
+    # defaultConfig: single merged block (duplicate key would silently drop tracing config)
     defaultConfig:
       tracing:
         zipkin:
           address: jaeger-collector.observability:9411
         sampling: 100.0   # 100% sampling in dev; reduce to 1.0 in prod
+      # Prevent app container starting before Envoy sidecar is ready
+      holdApplicationUntilProxyStarts: true
 
     # mTLS mode: STRICT enforces mTLS for all in-mesh traffic
     # Can be overridden per-namespace with PeerAuthentication
     # Set to PERMISSIVE during migration, STRICT once all services are enrolled
-    defaultConfig:
-      holdApplicationUntilProxyStarts: true   # prevent app starting before sidecar ready
 
     # Outbound traffic policy: REGISTRY_ONLY blocks traffic to unregistered services
     # ALLOW_ANY: allow all outbound (permissive, easier onboarding)
