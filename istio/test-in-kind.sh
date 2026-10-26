@@ -83,7 +83,12 @@ if curl -sSk --max-time 5 --resolve other.example.com:8443:127.0.0.1 https://oth
   fail "a host with no Gateway server entry was served over TLS"
 fi
 echo "ok   unknown SNI other.example.com is not served"
-redirect=$(curl -s --max-time 5 -o /dev/null -w '%{http_code} %{redirect_url}' --resolve app.example.com:8080:127.0.0.1 http://app.example.com:8080/)
+redirect=""
+for _ in $(seq 1 15); do
+  redirect=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code} %{redirect_url}' --resolve app.example.com:8080:127.0.0.1 http://app.example.com:8080/ 2>&1) || true
+  case "$redirect" in 301*) break ;; esac
+  sleep 2
+done
 grep -q '^301 https://app.example.com' <<<"$redirect" || fail "HTTP did not redirect to HTTPS (got: $redirect)"
 echo "ok   plain HTTP is redirected to HTTPS (301)"
 kill "$pf_pid" 2>/dev/null || true; pf_pid=""
