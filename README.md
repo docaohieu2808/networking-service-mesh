@@ -89,7 +89,7 @@ There is no l-max, TrafficSplit or SMI: SMI support was removed from Linkerd; HT
 ### Cilium (`cilium/`)
 | Level | File | What it teaches |
 |-------|------|-----------------|
-| l1 | `l1-install-helm-values-kubeproxy-replacement-hubble-enabled.yaml` | kube-proxy replacement, native routing, eBPF masquerade, Hubble |
+| l1 | `l1-install-helm-values-kubeproxy-replacement-hubble-enabled.yaml` | kube-proxy replacement, native routing, Hubble (eBPF masquerade is a documented switch, off because it broke DNS on kind) |
 | l2 | `l2-network-policy-l7-http-dns-egress-ingress-cilium-network-policy.yaml` | default deny, L7 HTTP rules, DNS-aware egress |
 | l3 | `l3-host-firewall-clusterwide-network-policy-audit-mode.yaml` | node-level policy; audit before enforce |
 | l-max | `l-max-ebpf-custom-xdp-packet-filter-rate-limit-program.c` | XDP program: blocklist/allowlist, token buckets for SYN/UDP/ICMP only |

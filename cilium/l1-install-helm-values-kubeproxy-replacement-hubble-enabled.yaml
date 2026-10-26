@@ -37,7 +37,7 @@ k8sServicePort: 6443
 ipam:
   mode: kubernetes                # kubernetes | cluster-pool | eni | azure | alibabacloud
 
-# -- Routing: native (no overlay) with eBPF masquerade
+# -- Routing: native (no overlay), iptables masquerade
 routingMode: native               # native | tunnel
 # tunnelProtocol: vxlan           # for routingMode: tunnel (vxlan | geneve)
 ipv4NativeRoutingCIDR: "10.0.0.0/8"   # must cover every pod CIDR; traffic inside it is not masqueraded
@@ -45,7 +45,11 @@ autoDirectNodeRoutes: true        # install routes to other nodes' pod CIDRs (sa
 enableIPv4Masquerade: true
 
 bpf:
-  masquerade: true                # eBPF masquerade instead of iptables
+  # eBPF masquerade (faster than iptables) is the usual production choice, but with
+  # it ON the kind CI cluster could not resolve names from musl/curl pods (the A and
+  # AAAA lookups of getaddrinfo timed out while nslookup worked). Bisected in CI:
+  # only this switch mattered. Test it on your own nodes before turning it on.
+  masquerade: false
   ctTcpMax: 524288                # connection tracking table sizes; raise for busy clusters
   ctAnyMax: 262144
 
