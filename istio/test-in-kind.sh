@@ -50,14 +50,14 @@ for _ in $(seq 1 30); do # wait until the sidecar has the VirtualService: header
   [ "$h1" -eq 0 ] && [ "$h2" -eq 5 ] && break
   sleep 2
 done
-[ "$h1" -eq 0 ] && [ "$h2" -eq 5 ] || fail "x-canary: true did not route all requests to v2 (v1=$h1 v2=$h2)"
+if [ "$h1" -ne 0 ] || [ "$h2" -ne 5 ]; then fail "x-canary: true did not route all requests to v2 (v1=$h1 v2=$h2)"; fi
 echo "ok   header x-canary: true routes 5/5 requests to v2"
 read -r v1 v2 <<<"$(split 200)"
 echo "     200 requests: v1=$v1 v2=$v2 (weights 90/10)"
 [ $((v1 + v2)) -eq 200 ] || fail "lost requests in the split test (v1=$v1 v2=$v2)"
 # Binomial(200, 0.1): mean 20, sd 4.2. [5, 40] is more than 3.5 sd either side, so a correct 90/10 split does not flake,
 # while 50/50 (round robin without weights) or 100/0 fails.
-{ [ "$v2" -ge 5 ] && [ "$v2" -le 40 ]; } || fail "canary split is not roughly 90/10 (v1=$v1 v2=$v2)"
+if [ "$v2" -lt 5 ] || [ "$v2" -gt 40 ]; then fail "canary split is not roughly 90/10 (v1=$v1 v2=$v2)"; fi
 echo "ok   weighted canary: v2 got ${v2}/200 requests (~10%)"
 
 kubectl apply -f l3-gateway-tls-termination-sni-routing-multi-host.yaml
@@ -108,7 +108,7 @@ for _ in $(seq 1 30); do
   body=$(curl -sS --max-time 5 --cacert "$tmp/ca.crt" --resolve "$res" https://app.example.com:8443/ 2>/dev/null) && break
   sleep 2
 done
-grep -q '^Name: app-service' <<<"$body" || { echo "$body"; fail "https://app.example.com through the gateway was not routed to app-service"; }
+grep -q '^Name: app-service' <<<"$body" || { echo "$body"; curl -svk --max-time 5 --resolve "$res" https://app.example.com:8443/ 2>&1 | tail -30 || true; kubectl -n istio-system logs deploy/istio-ingressgateway --tail=20 || true; fail "https://app.example.com through the gateway was not routed to app-service"; }
 echo "ok   SNI app.example.com: TLS verified against the Secret's certificate, routed to app-service"
 # A name the Gateway has no server entry for: even with verification off (-k) the handshake must be refused,
 # so this proves the gateway selects its server by SNI rather than answering everything with one certificate.

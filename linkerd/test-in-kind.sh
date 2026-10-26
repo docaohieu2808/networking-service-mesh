@@ -68,13 +68,14 @@ echo "ok   ServiceProfile timeouts are per route (GET cut at 3s -> 504, POST all
 # HTTPRoute retries (retry.linkerd.io/http=5xx, limit=2): make both backends answer /health with 500, send ONE GET
 # through the api-service Service (the catch-all rule, 90/10 split) and count what the backends received: with
 # retries 1 request + 2 retries = 3 hits; with no retries it would be 1.
-hits() { # total GET /health lines logged by the two backends
+# whoami --verbose logs each request twice (outer mux + handler), so two log lines are one request.
+hits() { # total GET /health requests received by the two backends
   local n=0 d c
   for d in api-service-v1 api-service-v2; do
     c=$(kubectl -n production logs "deploy/$d" -c app | grep -c '"GET /health ' || true)
     n=$((n + c))
   done
-  echo "$n"
+  echo $((n / 2))
 }
 for svc in api-service-v1 api-service-v2; do
   code=$(curl_in frontend -X POST -d 500 -o /dev/null -w '%{http_code}' "http://$svc.production:8080/health") || true
