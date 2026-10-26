@@ -12,9 +12,6 @@ jobs:
         include:
           - {name: A-as-is, sets: ""}
           - {name: B-tunnel, sets: "--set routingMode=tunnel --set tunnelProtocol=vxlan --set autoDirectNodeRoutes=false"}
-          - {name: C-no-xdp, sets: "--set loadBalancer.acceleration=disabled"}
-          - {name: D-no-bw, sets: "--set bandwidthManager.enabled=false"}
-          - {name: E-no-bpfmasq, sets: "--set bpf.masquerade=false"}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: .github/scripts/install-tools.sh kind helm
@@ -26,8 +23,15 @@ jobs:
             -f cilium/l1-install-helm-values-kubeproxy-replacement-hubble-enabled.yaml \
             --set k8sServiceHost=cilium-ci-control-plane --set k8sServicePort=6443 \
             --set operator.replicas=1 --set hubble.relay.replicas=1 ${{ matrix.sets }} --wait --timeout 8m
-      - name: dns
+      - name: curl dns
         run: |
           kubectl wait --for=condition=Ready nodes --all --timeout=120s
           kubectl -n kube-system rollout status deploy/coredns --timeout=120s
-          kubectl run dnsq --rm -i --restart=Never --image=busybox:1.37 -- nslookup kubernetes.default.svc.cluster.local
+          kubectl -n kube-system get pods -o wide | grep -E 'coredns|NAME'
+          kubectl run c1 --image=curlimages/curl:8.23.0 --restart=Never --command -- sleep 600
+          kubectl wait --for=condition=Ready pod/c1 --timeout=120s
+          kubectl get pod c1 -o wide
+          echo "--- nslookup inside curl image"; kubectl exec c1 -- nslookup kubernetes.default.svc.cluster.local || true
+          echo "--- curl by name"; kubectl exec c1 -- curl -sv --max-time 8 https://kubernetes.default.svc.cluster.local/healthz -k 2>&1 | tail -8 || true
+          echo "--- curl version"; kubectl exec c1 -- curl -V | head -3
+          echo "--- curl by IP"; ip=$(kubectl get svc kubernetes -o jsonpath='{.spec.clusterIP}'); kubectl exec c1 -- curl -sk --max-time 8 -o /dev/null -w '%{http_code}\n' https://$ip/healthz || true
