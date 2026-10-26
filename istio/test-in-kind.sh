@@ -61,6 +61,33 @@ if [ "$v2" -lt 5 ] || [ "$v2" -gt 40 ]; then fail "canary split is not roughly 9
 echo "ok   weighted canary: v2 got ${v2}/200 requests (~10%)"
 
 kubectl apply -f l3-gateway-tls-termination-sni-routing-multi-host.yaml
+
+echo "== l3 Gateway: TLS termination by SNI and HTTP redirect (through the ingress gateway, before l4/l-max: l-max sends gateway traffic to an ext-authz provider that does not exist here)"
+tmp=$(mktemp -d)
+pf_pid=""
+trap '[ -z "$pf_pid" ] || kill "$pf_pid" 2>/dev/null; rm -rf "$tmp"' EXIT
+kubectl -n istio-system get secret app-example-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > "$tmp/ca.crt"
+kubectl -n istio-system port-forward svc/istio-ingressgateway 8443:443 8080:80 >/dev/null 2>&1 &
+pf_pid=$!
+res=app.example.com:8443:127.0.0.1
+body=""
+for _ in $(seq 1 30); do
+  body=$(curl -sS --max-time 5 --cacert "$tmp/ca.crt" --resolve "$res" https://app.example.com:8443/ 2>/dev/null) && break
+  sleep 2
+done
+grep -q '^Name: app-service' <<<"$body" || { echo "$body"; curl -svk --max-time 5 --resolve "$res" https://app.example.com:8443/ 2>&1 | tail -30 || true; kubectl -n istio-system logs deploy/istio-ingressgateway --tail=20 || true; fail "https://app.example.com through the gateway was not routed to app-service"; }
+echo "ok   SNI app.example.com: TLS verified against the Secret's certificate, routed to app-service"
+# A name the Gateway has no server entry for: even with verification off (-k) the handshake must be refused,
+# so this proves the gateway selects its server by SNI rather than answering everything with one certificate.
+if curl -sSk --max-time 5 --resolve other.example.com:8443:127.0.0.1 https://other.example.com:8443/ >/dev/null 2>&1; then
+  fail "a host with no Gateway server entry was served over TLS"
+fi
+echo "ok   unknown SNI other.example.com is not served"
+redirect=$(curl -s --max-time 5 -o /dev/null -w '%{http_code} %{redirect_url}' --resolve app.example.com:8080:127.0.0.1 http://app.example.com:8080/)
+grep -q '^301 https://app.example.com' <<<"$redirect" || fail "HTTP did not redirect to HTTPS (got: $redirect)"
+echo "ok   plain HTTP is redirected to HTTPS (301)"
+kill "$pf_pid" 2>/dev/null || true; pf_pid=""
+
 kubectl apply -f l4-authorization-policy-mtls-peer-authentication-rbac.yaml
 kubectl apply -f l-max-envoy-filter-wasm-custom-lua-http-filter.yaml
 # The WasmPlugin points at a placeholder image: validate against the CRD, do not run it.
@@ -94,32 +121,6 @@ echo "ok   explicit ALLOW opens exactly that path (200)"
 hdr=$(curl_in production test-client -D - -o /dev/null http://api-service.production:8080/ | tr -d '\r')
 grep -qi '^x-served-by: envoy-lua' <<<"$hdr" || { echo "$hdr"; fail "Lua EnvoyFilter did not add x-served-by"; }
 echo "ok   Lua EnvoyFilter rewrote a live response (x-served-by: envoy-lua)"
-
-echo "== l3 Gateway: TLS termination by SNI and HTTP redirect (through the ingress gateway)"
-tmp=$(mktemp -d)
-pf_pid=""
-trap '[ -z "$pf_pid" ] || kill "$pf_pid" 2>/dev/null; rm -rf "$tmp"' EXIT
-kubectl -n istio-system get secret app-example-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > "$tmp/ca.crt"
-kubectl -n istio-system port-forward svc/istio-ingressgateway 8443:443 8080:80 >/dev/null 2>&1 &
-pf_pid=$!
-res=app.example.com:8443:127.0.0.1
-body=""
-for _ in $(seq 1 30); do
-  body=$(curl -sS --max-time 5 --cacert "$tmp/ca.crt" --resolve "$res" https://app.example.com:8443/ 2>/dev/null) && break
-  sleep 2
-done
-grep -q '^Name: app-service' <<<"$body" || { echo "$body"; curl -svk --max-time 5 --resolve "$res" https://app.example.com:8443/ 2>&1 | tail -30 || true; kubectl -n istio-system logs deploy/istio-ingressgateway --tail=20 || true; fail "https://app.example.com through the gateway was not routed to app-service"; }
-echo "ok   SNI app.example.com: TLS verified against the Secret's certificate, routed to app-service"
-# A name the Gateway has no server entry for: even with verification off (-k) the handshake must be refused,
-# so this proves the gateway selects its server by SNI rather than answering everything with one certificate.
-if curl -sSk --max-time 5 --resolve other.example.com:8443:127.0.0.1 https://other.example.com:8443/ >/dev/null 2>&1; then
-  fail "a host with no Gateway server entry was served over TLS"
-fi
-echo "ok   unknown SNI other.example.com is not served"
-redirect=$(curl -s --max-time 5 -o /dev/null -w '%{http_code} %{redirect_url}' --resolve app.example.com:8080:127.0.0.1 http://app.example.com:8080/)
-grep -q '^301 https://app.example.com' <<<"$redirect" || fail "HTTP did not redirect to HTTPS (got: $redirect)"
-echo "ok   plain HTTP is redirected to HTTPS (301)"
-kill "$pf_pid" 2>/dev/null || true; pf_pid=""
 
 echo "== ambient: mTLS without sidecars"
 kubectl apply -f lab/ambient-workloads.yaml
