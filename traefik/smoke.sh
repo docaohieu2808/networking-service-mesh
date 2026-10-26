@@ -95,7 +95,8 @@ YAML
   *) echo "unknown level $level"; exit 2 ;;
 esac
 
-# Static config must not produce errors (ACME failures in l3 are expected: no real CA).
-errs=$(dc logs traefik 2>&1 | grep -E ' ERR ' | grep -viE 'acme|certificate|letsencrypt|14000' || true)
+# Static config must not produce errors. Expected noise: ACME failures in l3 (no real CA) and the
+# Docker provider retrying for a moment while the socket proxy starts (routers above prove it connected).
+errs=$(dc logs traefik 2>&1 | grep -E ' ERR ' | grep -viE 'acme|certificate|letsencrypt|14000|docker-socket-proxy' || true)
 [ -z "$errs" ] || fail "unexpected errors in traefik log: $errs"
 echo "all $level smoke checks passed"

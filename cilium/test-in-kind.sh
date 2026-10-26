@@ -21,7 +21,9 @@ code() { # pod  method  path  [extra curl args]
 expect() { # name want got
   if [ "$2" != "$3" ]; then
     echo "FAIL $1: want '$2' got '$3'"
-    kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg policy get 2>&1 | head -60 || true
+    kubectl -n production exec deploy/frontend -- curl -sv --max-time 5 "$url/api/users" 2>&1 | tail -15 || true
+    kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg endpoint list 2>&1 | head -30 || true
+    kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status 2>&1 | head -30 || true
     exit 1
   fi
   echo "ok   $1 ($3)"

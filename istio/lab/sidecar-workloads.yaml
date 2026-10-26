@@ -13,6 +13,12 @@ kind: Namespace
 metadata:
   name: api-gateway
 ---
+# l4 allows integration traffic from this namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -101,3 +107,84 @@ spec:
             requests:
               cpu: 10m
               memory: 16Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reviews-v1
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reviews
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: reviews
+        version: v1
+    spec:
+      containers:
+        - name: app
+          image: traefik/whoami:v1.12.0
+          args: ["--port", "8080", "--name", "reviews-v1"]
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reviews-v2
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reviews
+      version: v2
+  template:
+    metadata:
+      labels:
+        app: reviews
+        version: v2
+    spec:
+      containers:
+        - name: app
+          image: traefik/whoami:v1.12.0
+          args: ["--port", "8080", "--name", "reviews-v2"]
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reviews
+  namespace: production
+spec:
+  selector:
+    app: reviews
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

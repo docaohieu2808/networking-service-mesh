@@ -161,7 +161,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install toolchain
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm libbpf-dev linux-libc-dev iproute2 iputils-ping
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm libbpf-dev linux-libc-dev gcc-multilib iproute2 iputils-ping
       - name: Build, load past the verifier, flood-test in a netns
         run: ./cilium/test-xdp.sh
 

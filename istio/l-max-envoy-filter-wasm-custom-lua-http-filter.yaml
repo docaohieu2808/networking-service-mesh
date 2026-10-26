@@ -16,6 +16,9 @@
 # ── External authorization the supported way ─────────────────────────────────
 # The provider (name, gRPC service, timeout, failOpen: false) is declared once in
 # meshConfig.extensionProviders. This policy sends matching requests to it.
+# CUSTOM is enforced by Envoy proxies (sidecars, gateways, waypoints). ztunnel does
+# not support it, so istioctl analyze notes it for ambient: that is expected here
+# because the target is the ingress gateway.
 # The earlier version of this file hand-wrote an ext_authz EnvoyFilter plus a raw
 # cluster; this replaces both.
 apiVersion: security.istio.io/v1
@@ -46,6 +49,7 @@ metadata:
   name: lua-request-id-injector
   namespace: production
 spec:
+  priority: 10                            # relative patches (INSERT_BEFORE) need a priority to be ordered reliably
   workloadSelector:
     labels:
       app: api-service

@@ -81,9 +81,10 @@ metadata:
   namespace: production
 spec:
   # Applies to requests for this hostname (K8s Service FQDN)
+  # One host spelling only: "reviews" and the FQDN are the same host to Istio, and
+  # listing both makes the analyzer report the host as defined twice (IST0109).
   hosts:
     - reviews.production.svc.cluster.local
-    - reviews   # short name within namespace
 
   # Attach to these Gateways (omit for in-mesh traffic only)
   # gateways:
@@ -105,6 +106,24 @@ spec:
             host: reviews.production.svc.cluster.local
             subset: v2
           weight: 100
+
+    # ── Rule 1b: shadow traffic. Requests marked x-shadow go to v1 and are COPIED to v2;
+    # the client only ever sees v1's answer. (A second VirtualService for the same host
+    # in another namespace would conflict with this one: IST0109. Keep one per host.)
+    - name: traffic-mirroring
+      match:
+        - headers:
+            x-shadow:
+              exact: "true"
+      route:
+        - destination:
+            host: reviews.production.svc.cluster.local
+            subset: v1
+      mirror:
+        host: reviews.production.svc.cluster.local
+        subset: v2
+      mirrorPercentage:
+        value: 10.0
 
     # ── Rule 2: Weighted canary split (10% to v2, 90% to v1) ─────────────────
     - name: weighted-canary-split
@@ -138,34 +157,3 @@ spec:
       #     percentage:
       #       value: 5.0      # return HTTP 500 for 5% of requests
       #     httpStatus: 500
-
----
-# ── VirtualService: cross-namespace routing (api-gateway → production/reviews) ─
-apiVersion: networking.istio.io/v1
-kind: VirtualService
-metadata:
-  name: reviews-external-routing
-  namespace: api-gateway
-spec:
-  exportTo: ["."]      # only sidecars in api-gateway see this rule, so it does not fight the one in production
-  hosts:
-    - reviews.production.svc.cluster.local
-  http:
-    # Mirror 10% of traffic to v2 for shadow testing (no impact on response)
-    - name: traffic-mirroring
-      route:
-        - destination:
-            host: reviews.production.svc.cluster.local
-            subset: v1
-          weight: 100
-      mirror:
-        host: reviews.production.svc.cluster.local
-        subset: v2
-      mirrorPercentage:
-        value: 10.0
-
-      timeout: 10s
-      retries:
-        attempts: 2
-        perTryTimeout: 4s
-        retryOn: "5xx,connect-failure"
