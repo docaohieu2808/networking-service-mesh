@@ -153,10 +153,10 @@ Dependabot updates actions, the OpenResty Dockerfile and the Traefik compose ima
 | coredns | l1 and l-max Corefiles answer real queries (hosts, template, DNSSEC RRSIG, chaos) |
 | traefik (x5) | `docker compose up --wait` per level, then HTTP/TCP checks (routing, redirect, auth, ACME wiring, plugins, hot reload) |
 | schemas | `kubeconform -strict` against the Kubernetes + CRD schemas for Istio, Cilium, Linkerd and Gateway API; every Helm values key must exist in the chart; charts render; `istioctl manifest generate` |
-| xdp | `clang -target bpf -Wall -Werror`, kernel verifier, ICMP flood dropped in a netns |
+| xdp | `clang -target bpf -Wall -Werror`, kernel verifier; in a netns the same 200-ping flood loses <10% with no XDP and >=50% with it, normal pings pass before and after |
 | kind-cilium | Cilium as the CNI with the l1 values; L7 policy allows and denies as written; an un-named pod in the same namespace cannot connect |
-| kind-istio | ambient install with the l1 values; all manifests applied; `istioctl analyze`; deny-all then allow; Lua filter changes a live response; ambient traffic over HBONE; Gateway API proxies |
-| kind-linkerd | edge install with the l1 values; injection; only the allowed ServiceAccount gets through; HTTPRoute path split |
+| kind-istio | ambient install with the l1 values; all manifests applied; `istioctl analyze`; l2 canary: 200 requests split roughly 90/10 and `x-canary: true` goes 100% to v2; l3 Gateway: HTTPS via `curl --resolve` is verified against the Secret's certificate and routed, an unknown SNI is refused, HTTP gets a 301; deny-all then allow; Lua filter changes a live response; ambient traffic over HBONE; Gateway API proxies |
+| kind-linkerd | edge install with the l1 values; injection; only the allowed ServiceAccount gets through; HTTPRoute path split; ServiceProfile timeouts per route (GET 6s answer cut to 504, POST allowed); HTTPRoute retries (one failing GET reaches the backends 3 times) |
 | kind-coredns | l2 Corefile as a second CoreDNS resolves `kubernetes.default.svc.cluster.local` |
 
 ## Honest limits

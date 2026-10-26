@@ -1,0 +1,34 @@
+# Pods behind the app-service Service that lab/referenced-services.yaml defines, so the l3 Gateway has something
+# real to route to: the CI check sends HTTPS requests through the ingress gateway and expects this pod to answer.
+# Namespace production is sidecar-injected; l4 only lets the ingress gateway's ServiceAccount reach it on 3000.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-service
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-service
+  template:
+    metadata:
+      labels:
+        app: app-service
+    spec:
+      containers:
+        - name: app
+          image: traefik/whoami:v1.12.0
+          args: ["--port", "3000", "--name", "app-service"]
+          ports:
+            - containerPort: 3000
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi

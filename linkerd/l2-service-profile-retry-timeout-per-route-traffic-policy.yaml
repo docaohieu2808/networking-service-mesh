@@ -194,7 +194,7 @@ spec:
       containers:
         - name: app
           image: traefik/whoami:v1.12.0
-          args: ["--port", "8080", "--name", "v1"]
+          args: ["--port", "8080", "--name", "v1", "--verbose"]
           ports: [{containerPort: 8080}]
           securityContext: {allowPrivilegeEscalation: false, runAsNonRoot: true, runAsUser: 10001, capabilities: {drop: [ALL]}}
           resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 64Mi}}
@@ -215,7 +215,7 @@ spec:
       containers:
         - name: app
           image: traefik/whoami:v1.12.0
-          args: ["--port", "8080", "--name", "v2"]
+          args: ["--port", "8080", "--name", "v2", "--verbose"]
           ports: [{containerPort: 8080}]
           securityContext: {allowPrivilegeEscalation: false, runAsNonRoot: true, runAsUser: 10001, capabilities: {drop: [ALL]}}
           resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 64Mi}}
