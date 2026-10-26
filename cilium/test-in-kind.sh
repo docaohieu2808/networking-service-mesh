@@ -21,7 +21,13 @@ code() { # pod  method  path  [extra curl args]
 expect() { # name want got
   if [ "$2" != "$3" ]; then
     echo "FAIL $1: want '$2' got '$3'"
+    node=$(kubectl -n production get pod -l app=frontend -o jsonpath='{.items[0].spec.nodeName}')
+    cpod=$(kubectl -n kube-system get pod -l k8s-app=cilium --field-selector spec.nodeName="$node" -o name)
+    ( timeout 12 kubectl -n kube-system exec "$cpod" -c cilium-agent -- cilium-dbg monitor -t drop -t policy-verdict > /tmp/monitor.log 2>&1 & )
+    sleep 2
+    kubectl -n production exec deploy/frontend -- cat /etc/resolv.conf || true
     kubectl -n production exec deploy/frontend -- curl -sv --max-time 5 "$url/api/users" 2>&1 | tail -15 || true
+    sleep 6; head -40 /tmp/monitor.log || true
     kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg endpoint list 2>&1 | head -30 || true
     kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status 2>&1 | head -30 || true
     exit 1

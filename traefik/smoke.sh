@@ -55,7 +55,8 @@ case "$level" in
     curl -fs "$API/api/http/routers/webapp@docker" | jq -e '.tls.options == "hardened@file" and .tls.certResolver == "letsencrypt"' >/dev/null || fail "webapp tls options/resolver"
     curl -fs "$API/api/http/routers/api@docker"    | jq -e '.tls.certResolver == "letsencrypt-dns"' >/dev/null || fail "wildcard router must use the DNS-01 resolver"
     echo "ok   resolvers wired: HTTP-01 for the host, DNS-01 for the wildcard"
-    retry "hardened TLS option loaded from file" bash -c "curl -fs $API/api/overview | jq -e '.tls.options.total >= 1'"
+    # A router that names a TLS option which does not exist is disabled with an error.
+    retry "hardened@file resolved (router enabled, no error)" bash -c "curl -fs $API/api/http/routers/webapp@docker | jq -e '.status == \"enabled\" and (.error // [] | length == 0)'"
     retry "http redirects to https"    bash -c "c=\$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: app.example.com' http://127.0.0.1/); [ \$c = 301 ] || [ \$c = 308 ]"
     ;;
   l4)
