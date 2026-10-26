@@ -1,0 +1,313 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Weekly: image tags, Helm charts and the Traefik plugin catalog move even when this repo does not.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ISTIO_VERSION: "1.30.7"
+  CILIUM_VERSION: "1.20.4"
+  LINKERD_CHART_VERSION: "2026.10.1"
+  GATEWAY_API_VERSION: "v1.6.3"
+
+jobs:
+  lint:
+    name: lint (actionlint, shellcheck, hadolint, yamllint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.12 -color
+
+      - name: shellcheck
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh')
+          shellcheck -x "${scripts[@]}"
+
+      - name: hadolint
+        run: docker run --rm -i hadolint/hadolint:v2.14.0 < nginx/openresty.Dockerfile
+
+      - name: yamllint
+        run: |
+          python3 -m venv "$RUNNER_TEMP/yl"
+          "$RUNNER_TEMP/yl/bin/pip" install --quiet yamllint==1.38.0
+          "$RUNNER_TEMP/yl/bin/yamllint" -c .yamllint.yml --strict .
+
+  haproxy:
+    name: haproxy -c (3.4 LTS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: haproxy -c -dW on every level (warnings fail the job)
+        run: ./haproxy/check.sh
+
+  nginx:
+    name: nginx -t, openresty -t, JWT behaviour
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: nginx -t (l1-l4), ModSecurity image (l3b), openresty -t (l-max)
+        run: ./nginx/check.sh
+      - name: OpenResty JWT - forged token rejected, auth on every route, fails closed
+        run: ./nginx/test-jwt.sh
+
+  coredns:
+    name: coredns (l1, l-max)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install dig
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq dnsutils
+      - name: Query the real CoreDNS image
+        run: ./coredns/test.sh
+
+  traefik:
+    name: traefik ${{ matrix.level }} (compose up + smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        level: [l1, l2, l3, l4, lmax]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free ports 80/443 (runner image ships none, but be explicit)
+        run: |
+          ! sudo ss -ltn '( sport = :80 or sport = :443 or sport = :8080 or sport = :9000 )' | grep -q LISTEN
+      - name: docker compose up --wait and smoke-test
+        run: ./traefik/smoke.sh ${{ matrix.level }}
+
+  schemas:
+    name: kubeconform -strict, Helm values, istioctl
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned tools
+        run: .github/scripts/install-tools.sh helm istioctl kubeconform
+
+      - name: kubeconform -strict with CRD schemas (Istio, Cilium, Linkerd, Gateway API)
+        run: |
+          # Built-in kinds from the Kubernetes schemas, CRDs from the community catalog.
+          kubeconform -strict -summary -ignore-missing-schemas=false \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            istio/l1-telemetry-tracing-access-log-telemetry-api.yaml \
+            istio/l2-*.yaml istio/l3-*.yaml istio/l3b-*.yaml istio/l4-*.yaml \
+            istio/l-max-*.yaml istio/lab/*.yaml \
+            cilium/l2-*.yaml cilium/l3-*.yaml cilium/lab/*.yaml \
+            linkerd/l1b-*.yaml linkerd/l2-*.yaml linkerd/lab/*.yaml \
+            coredns/lab/*.yaml
+
+      - name: Helm values are real (no key silently ignored) and the charts render
+        run: |
+          helm repo add istio https://istio-release.storage.googleapis.com/charts
+          helm repo add cilium https://helm.cilium.io/
+          helm repo add linkerd-edge https://helm.linkerd.io/edge
+          helm repo update
+          mkdir charts && cd charts
+          helm pull istio/istiod   --version "$ISTIO_VERSION" --untar
+          helm pull istio/gateway  --version "$ISTIO_VERSION" --untar
+          helm pull cilium/cilium  --version "$CILIUM_VERSION" --untar
+          helm pull linkerd-edge/linkerd-control-plane --version "$LINKERD_CHART_VERSION" --untar
+          cd ..
+          check=.github/scripts/check-helm-values-keys.py
+          python3 "$check" istio/l1-install-*.yaml charts/istiod --freeform meshConfig
+          python3 "$check" istio/l1c-*.yaml charts/gateway
+          python3 "$check" cilium/l1-*.yaml charts/cilium
+          python3 "$check" linkerd/l1-install-*.yaml charts/linkerd-control-plane
+          helm lint charts/istiod -f istio/l1-install-*.yaml
+          helm template istiod charts/istiod -n istio-system -f istio/l1-install-*.yaml > /dev/null
+          helm template gw charts/gateway -n istio-system -f istio/l1c-*.yaml > /dev/null
+          helm template cilium charts/cilium -n kube-system -f cilium/l1-*.yaml > /dev/null
+          linkerd/gen-certs.sh "$RUNNER_TEMP/certs" > /dev/null
+          helm template lcp charts/linkerd-control-plane -n linkerd -f linkerd/l1-install-*.yaml \
+            --set-file identityTrustAnchorsPEM="$RUNNER_TEMP/certs/ca.crt" \
+            --set-file identity.issuer.tls.crtPEM="$RUNNER_TEMP/certs/issuer.crt" \
+            --set-file identity.issuer.tls.keyPEM="$RUNNER_TEMP/certs/issuer.key" > /dev/null
+
+      - name: istioctl renders the IstioOperator file offline
+        run: istioctl manifest generate -f istio/l1b-istiooperator-sidecar-install-istioctl.yaml > /dev/null
+
+  xdp:
+    name: XDP program (clang build, verifier, rate limit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm libbpf-dev linux-libc-dev iproute2 iputils-ping
+      - name: Build, load past the verifier, flood-test in a netns
+        run: ./cilium/test-xdp.sh
+
+  kind-cilium:
+    name: kind + Cilium CNI (l1 values, l2 policies)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned tools
+        run: .github/scripts/install-tools.sh kind helm
+
+      - name: Create kind cluster without CNI or kube-proxy
+        run: kind create cluster --name cilium-ci --config .github/kind/cilium.yaml
+
+      - name: Install Cilium with the l1 values
+        run: |
+          helm repo add cilium https://helm.cilium.io/
+          helm repo update
+          # Only the API server address and replica counts differ from the file (2 kind nodes, no external API IP).
+          helm install cilium cilium/cilium --namespace kube-system --version "$CILIUM_VERSION" \
+            -f cilium/l1-install-helm-values-kubeproxy-replacement-hubble-enabled.yaml \
+            --set k8sServiceHost=cilium-ci-control-plane --set k8sServicePort=6443 \
+            --set operator.replicas=1 --set hubble.relay.replicas=1 \
+            --wait --timeout 8m
+
+      - name: Wait for nodes, Cilium and Hubble
+        run: |
+          kubectl wait --for=condition=Ready nodes --all --timeout=180s
+          kubectl -n kube-system rollout status ds/cilium --timeout=180s
+          kubectl -n kube-system rollout status deploy/cilium-operator --timeout=180s
+          kubectl -n kube-system rollout status deploy/hubble-relay --timeout=180s
+          kubectl -n kube-system rollout status deploy/hubble-ui --timeout=180s
+          kubectl -n kube-system rollout status deploy/coredns --timeout=180s
+          kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status --brief
+
+      - name: Apply the l2/l3 manifests and test the policies
+        run: ./cilium/test-in-kind.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl -n kube-system logs ds/cilium -c cilium-agent --tail=80 || true
+          kubectl -n kube-system get cnp,ccnp -A || true
+
+  kind-istio:
+    name: kind + Istio ambient (l1 values, l2-l4, l-max, Gateway API)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned tools
+        run: .github/scripts/install-tools.sh kind helm istioctl
+
+      - name: Create kind cluster
+        run: kind create cluster --name istio-ci
+
+      - name: Gateway API CRDs (Istio does not install them)
+        run: kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+
+      - name: Install Istio ambient with Helm (base, istiod with the l1 values, cni, ztunnel, ingress gateway)
+        run: |
+          helm repo add istio https://istio-release.storage.googleapis.com/charts
+          helm repo update
+          helm install istio-base istio/base -n istio-system --create-namespace --version "$ISTIO_VERSION" --wait
+          # autoscaleMin/memory lowered for a one-node kind cluster; everything else is the file.
+          helm install istiod istio/istiod -n istio-system --version "$ISTIO_VERSION" \
+            -f istio/l1-install-profile-minimal-demo-ambient-helm-values.yaml \
+            --set autoscaleMin=1 --set resources.requests.memory=256Mi --wait --timeout 8m
+          helm install istio-cni istio/cni -n istio-system --version "$ISTIO_VERSION" --set profile=ambient --wait --timeout 8m
+          helm install ztunnel istio/ztunnel -n istio-system --version "$ISTIO_VERSION" --wait --timeout 8m
+          helm install istio-ingressgateway istio/gateway -n istio-system --version "$ISTIO_VERSION" \
+            -f istio/l1c-ingress-gateway-helm-values.yaml \
+            --set service.type=NodePort --set autoscaling.enabled=false --wait --timeout 8m
+
+      - name: Apply every manifest and test sidecar, ambient and Gateway API behaviour
+        run: ./istio/test-in-kind.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl -n istio-system logs deploy/istiod --tail=80 || true
+          kubectl -n istio-system logs ds/ztunnel --tail=60 || true
+          istioctl analyze -A || true
+
+  kind-linkerd:
+    name: kind + Linkerd edge (l1 values, l1b, l2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned tools
+        run: .github/scripts/install-tools.sh kind helm
+
+      - name: Create kind cluster
+        run: kind create cluster --name linkerd-ci
+
+      - name: Install Linkerd from the OSS edge charts
+        run: |
+          helm repo add linkerd-edge https://helm.linkerd.io/edge
+          helm repo update
+          linkerd/gen-certs.sh "$RUNNER_TEMP/certs" > /dev/null
+          helm install linkerd-crds linkerd-edge/linkerd-crds -n linkerd --create-namespace \
+            --version "$LINKERD_CHART_VERSION" --set installGatewayAPI=true --wait
+          # Single replica and no anti-affinity because the kind cluster has one node.
+          helm install linkerd-control-plane linkerd-edge/linkerd-control-plane -n linkerd \
+            --version "$LINKERD_CHART_VERSION" \
+            -f linkerd/l1-install-inject-control-plane-namespace-annotation.yaml \
+            --set controllerReplicas=1 --set enablePodAntiAffinity=false \
+            --set-file identityTrustAnchorsPEM="$RUNNER_TEMP/certs/ca.crt" \
+            --set-file identity.issuer.tls.crtPEM="$RUNNER_TEMP/certs/issuer.crt" \
+            --set-file identity.issuer.tls.keyPEM="$RUNNER_TEMP/certs/issuer.key" \
+            --wait --timeout 8m
+          kubectl -n linkerd rollout status deploy --timeout=180s
+
+      - name: Apply the manifests and test injection, policy and HTTPRoute
+        run: ./linkerd/test-in-kind.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl -n linkerd logs deploy/linkerd-destination -c policy --tail=60 || true
+          kubectl -n production describe pods | tail -60 || true
+
+  kind-coredns:
+    name: kind + CoreDNS l2 Corefile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned tools
+        run: .github/scripts/install-tools.sh kind
+      - name: Create kind cluster
+        run: kind create cluster --name dns-ci
+      - name: Run the l2 Corefile as a second CoreDNS and resolve cluster names through it
+        run: ./coredns/test-in-kind.sh
+      - name: Diagnostics on failure
+        if: failure()
+        run: kubectl -n dns-lab logs deploy/coredns-lab --tail=60 || true

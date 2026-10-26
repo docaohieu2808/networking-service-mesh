@@ -1,0 +1,51 @@
+# Dynamic config (file provider, hot-reloaded): HTTP routers, services, middlewares.
+http:
+  middlewares:
+    secure-headers:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        customResponseHeaders:
+          X-Robots-Tag: "noindex,nofollow,nosnippet,noarchive,notranslate,noimageindex"
+          Server: ""                      # empty value deletes the header
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true        # (add stsPreload only after reading hstspreload.org)
+
+    compress-gzip:
+      compress:
+        excludedContentTypes:
+          - text/event-stream
+
+  routers:
+    backend-a:
+      entryPoints: [web]
+      rule: "Host(`a.localhost`)"
+      service: svc-backend-a
+      middlewares: [secure-headers, compress-gzip]
+
+    backend-b:
+      entryPoints: [web]
+      rule: "Host(`b.localhost`) && PathPrefix(`/api`)"
+      service: svc-backend-b
+
+  services:
+    svc-backend-a:
+      loadBalancer:
+        healthCheck:
+          path: /health
+          interval: 10s
+          timeout: 3s
+        servers:
+          - url: "http://backend-a:80"
+          - url: "http://backend-a2:80"   # second replica
+        sticky:
+          cookie:
+            name: lb_session
+            httpOnly: true
+
+    svc-backend-b:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://backend-b:80"

@@ -1,114 +1,75 @@
-# CoreDNS L2 — Kubernetes Service Discovery: k8s plugin, stub zones, split-horizon DNS
-# Demonstrates: kubernetes plugin, pods verified mode, stub zones for external DNS,
-#               split-horizon (different answers inside/outside cluster), node-local DNS
+# CoreDNS L2 - Kubernetes service discovery: kubernetes plugin, stub zones, split-horizon
+# Demonstrates: the kubernetes plugin, a real in-cluster Corefile layout
+#               (health/ready/loop/reload/forward to the node resolver), and
+#               stub zones that send corp/VPC names to internal DNS servers.
 #
-# This Corefile is intended to run as the in-cluster DNS (replaces kube-dns).
-# Deploy via ConfigMap in kube-system namespace:
-#   kubectl -n kube-system create configmap coredns --from-file=Corefile=./l2-kubernetes-service-discovery-k8s-plugin-stub-zones-corefile.Corefile
+# This is the shape of the Corefile that kubeadm/EKS/GKE ship, plus two stub zones.
+# Tested in CI: ./test-in-kind.sh deploys it as a *second* CoreDNS (namespace
+# dns-lab, never touching kube-system) in a kind cluster and resolves
+# kubernetes.default.svc.cluster.local through it.
+#
+# On a real cluster, put it in the `coredns` ConfigMap in kube-system:
+#   kubectl -n kube-system create configmap coredns --from-file=Corefile=<this file> --dry-run=client -o yaml | kubectl apply -f -
+# CoreDNS reloads it by itself (reload plugin) a minute or two later.
 #
 # Reference: https://kubernetes.io/docs/tasks/administer-cluster/dns-custom-nameservers/
 
-# ── Cluster-local zone: cluster.local ────────────────────────────────────────
-# Handles all *.cluster.local queries (Services, Pods, headless SRV records)
-cluster.local:53 {
-    errors
-
-    # kubernetes: resolves Service and Pod DNS within the cluster
-    kubernetes cluster.local in-addr.arpa ip6.arpa {
-        # pods verified: CoreDNS checks pod IP matches the requesting pod
-        # (prevents DNS spoofing between pods)
-        pods verified
-
-        # fallthrough: if no k8s record found, pass to next plugin
-        fallthrough in-addr.arpa ip6.arpa
-
-        # TTL for kubernetes records (default 5s, lower = faster failover)
-        ttl 5
-
-        # Expose all namespaces (default); restrict with:
-        # namespaces default production staging
-    }
-
-    # Prometheus metrics
-    prometheus :9153
-
-    # Cache k8s responses (short TTL — services change frequently)
-    cache 30
-
-    # Loop detection (prevents infinite forwarding loops)
-    loop
-
-    # Reload Corefile on ConfigMap change
-    reload 30s
-
-    health :8080
-}
-
-# ── Reverse DNS for pod/service CIDRs ────────────────────────────────────────
-in-addr.arpa:53 {
-    kubernetes cluster.local in-addr.arpa ip6.arpa {
-        pods verified
-        fallthrough in-addr.arpa ip6.arpa
-        ttl 5
-    }
-    errors
-    cache 30
-}
-
 # ── Stub zone: company internal DNS (split-horizon) ──────────────────────────
-# Queries for *.corp.example.com are forwarded to on-prem DNS, not the internet.
-# This prevents leaking internal hostnames to public resolvers.
+# *.corp.example.com goes to the on-prem resolvers instead of the internet, so
+# internal names never leak to public DNS.
 corp.example.com:53 {
+    errors
     forward . 10.10.0.53 10.10.0.54 {
-        # Force TCP for large DNSSEC responses from internal AD DNS
-        force_tcp
+        force_tcp                    # large answers from AD DNS
         health_check 10s
         max_fails 2
         expire 30s
     }
     cache 120
-    errors
-    log . {
-        class error
-    }
 }
 
-# ── Stub zone: AWS VPC private hosted zone ────────────────────────────────────
-# Route 53 private zones only resolve from within the VPC.
-# Forward *.aws.internal to the VPC resolver (169.254.169.253).
+# ── Stub zone: cloud private hosted zone ─────────────────────────────────────
+# Route 53 private zones only resolve through the VPC resolver (169.254.169.253).
 aws.internal:53 {
+    errors
     forward . 169.254.169.253 {
         health_check 15s
     }
     cache 60
-    errors
 }
 
-# ── Root zone: all other queries go to public resolvers ──────────────────────
+# ── Everything else: cluster names + the node's own resolver ─────────────────
 .:53 {
     errors
 
-    # health: shared with cluster.local block (only one listener per port)
-    # Omit health here to avoid duplicate listener conflict.
-
-    # forward external queries to public DNS over TLS (DoT)
-    forward . tls://1.1.1.1 tls://1.0.0.1 {
-        tls_servername cloudflare-dns.com
-        health_check 10s
-        max_fails 3
-        expire 30s
-        policy random
+    # Liveness (:8080/health) and readiness (:8181/ready). They are declared once,
+    # here: a second `health` on the same port in another block fails to bind.
+    health {
+        lameduck 5s
     }
+    ready
 
-    cache 300 {
-        success 10000
-        denial  5000
+    # Services, headless SRV records and (insecure) pod A records.
+    # `pods insecure` is what upstream ships. `pods verified` makes CoreDNS check
+    # that the pod exists, which costs memory on large clusters and is NOT a
+    # spoofing defence: any pod can still query any name.
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+        pods insecure
+        fallthrough in-addr.arpa ip6.arpa
+        ttl 30
+        # namespaces default production staging     # restrict what is served
     }
-
-    # Prevent forwarding loop if this CoreDNS instance is also the node resolver
-    loop
 
     prometheus :9153
 
-    reload 30s
+    # Non-cluster names: use whatever the node itself uses (VPC DNS, corporate
+    # DNS). Forcing a public DoT upstream here would bypass internal DNS.
+    forward . /etc/resolv.conf {
+        max_concurrent 1000
+    }
+
+    cache 30
+    loop          # stop if the upstream is this very CoreDNS
+    reload        # pick up ConfigMap changes
+    loadbalance   # shuffle A/AAAA answers
 }

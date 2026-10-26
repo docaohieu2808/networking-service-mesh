@@ -2,12 +2,14 @@
 # Demonstrates: weighted routing, header-based routing, fault injection,
 #               connection pool tuning, outlier detection, canary deployments
 #
+# API version: networking.istio.io/v1 (GA since Istio 1.22; v1beta1 is still served but is the old name).
 # Apply: kubectl apply -f l2-virtual-service-destination-rule-traffic-splitting-canary.yaml
-# Prereq: namespace labeled with istio-injection=enabled
+# Prereq: namespaces production and api-gateway exist; sidecar mode needs
+#         `istio-injection=enabled` on them, ambient mode needs a waypoint for L7 routing.
 
 ---
 # ── DestinationRule: define subsets (versions) and connection policy ──────────
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: reviews-destination-rule
@@ -17,6 +19,12 @@ spec:
 
   # Traffic policy applies to all subsets unless overridden
   trafficPolicy:
+    # mTLS to the workload with Istio-issued certs. This is already the default
+    # (auto mTLS), so it is stated here only to make the intent explicit. It lives
+    # in THIS rule: two DestinationRules for the same host in one namespace are not
+    # merged except for their subsets, so a second rule's trafficPolicy is lost.
+    tls:
+      mode: ISTIO_MUTUAL
     # Connection pool: limits concurrent connections/requests to each pod
     connectionPool:
       tcp:
@@ -66,7 +74,7 @@ spec:
 
 ---
 # ── VirtualService: routing rules for the reviews service ─────────────────────
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: reviews-virtual-service
@@ -133,12 +141,13 @@ spec:
 
 ---
 # ── VirtualService: cross-namespace routing (api-gateway → production/reviews) ─
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: reviews-external-routing
   namespace: api-gateway
 spec:
+  exportTo: ["."]      # only sidecars in api-gateway see this rule, so it does not fight the one in production
   hosts:
     - reviews.production.svc.cluster.local
   http:
@@ -160,16 +169,3 @@ spec:
         attempts: 2
         perTryTimeout: 4s
         retryOn: "5xx,connect-failure"
-
----
-# ── DestinationRule: mTLS policy for the service ─────────────────────────────
-apiVersion: networking.istio.io/v1beta1
-kind: DestinationRule
-metadata:
-  name: reviews-mtls-policy
-  namespace: production
-spec:
-  host: reviews.production.svc.cluster.local
-  trafficPolicy:
-    tls:
-      mode: ISTIO_MUTUAL    # use Istio-managed mTLS certs (MUTUAL = bring-your-own)

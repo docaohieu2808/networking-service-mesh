@@ -1,0 +1,75 @@
+# A second CoreDNS for the l2 test. Lives in its own namespace and listens on its
+# own Service, so it never touches the cluster's real DNS in kube-system.
+# The Corefile ConfigMap (coredns-lab) is created by test-in-kind.sh from the l2 file.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns-lab
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coredns-lab
+  namespace: dns-lab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: coredns-lab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:coredns          # same permissions the stock CoreDNS uses
+subjects:
+  - kind: ServiceAccount
+    name: coredns-lab
+    namespace: dns-lab
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns-lab
+  namespace: dns-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: coredns-lab}
+  template:
+    metadata:
+      labels: {app: coredns-lab}
+    spec:
+      serviceAccountName: coredns-lab
+      containers:
+        - name: coredns
+          image: coredns/coredns:1.15.0
+          args: ["-conf", "/etc/coredns/Corefile"]
+          ports:
+            - {name: dns, containerPort: 53, protocol: UDP}
+            - {name: dns-tcp, containerPort: 53, protocol: TCP}
+          readinessProbe:
+            httpGet: {path: /ready, port: 8181}
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - {name: config, mountPath: /etc/coredns, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: coredns-lab
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coredns-lab
+  namespace: dns-lab
+spec:
+  selector: {app: coredns-lab}
+  ports:
+    - {name: dns, port: 53, protocol: UDP, targetPort: 53}
+    - {name: dns-tcp, port: 53, protocol: TCP, targetPort: 53}

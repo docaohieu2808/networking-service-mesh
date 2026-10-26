@@ -1,0 +1,16 @@
+# Dynamic config: raw TCP routing on the tcp-custom entry point (:9000).
+# For the lab the target is a whoami container, so `curl http://127.0.0.1:9000/`
+# works through a plain TCP proxy. Swap the address for e.g. "postgres:5432"
+# and use HostSNI(`db.example.com`) with TLS passthrough for a real database.
+tcp:
+  routers:
+    tcp-passthrough-demo:
+      entryPoints: [tcp-custom]
+      rule: "HostSNI(`*`)"
+      service: svc-tcp-demo
+
+  services:
+    svc-tcp-demo:
+      loadBalancer:
+        servers:
+          - address: "backend-b:80"

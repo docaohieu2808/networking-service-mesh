@@ -1,0 +1,4 @@
+# one case-insensitive substring per line
+sqlmap
+nikto
+nmap

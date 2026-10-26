@@ -2,13 +2,18 @@
 # Demonstrates: namespace-wide mTLS enforcement, service-level RBAC,
 #               JWT end-user authentication, deny-by-default, allow-listing
 #
+# API: security.istio.io/v1 (GA since Istio 1.22).
 # Apply: kubectl apply -f l4-authorization-policy-mtls-peer-authentication-rbac.yaml
+# Prereq: the ingress gateway from l1c (ServiceAccount istio-ingressgateway).
+# Sidecar mode: these policies are enforced by each pod's proxy.
+# Ambient mode: L4 rules (principals, namespaces, ports) are enforced by ztunnel;
+# rules on methods/paths/JWT claims need a waypoint (see l3b).
 
 ---
 # ── PeerAuthentication: enforce strict mTLS namespace-wide ───────────────────
 # All pods in 'production' namespace must use mTLS for inbound traffic.
 # Sidecars that haven't migrated yet: set mode: PERMISSIVE on their own PA.
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
   name: production-strict-mtls
@@ -19,7 +24,7 @@ spec:
 
 ---
 # ── PeerAuthentication: per-workload override (legacy service still migrating) ─
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
   name: legacy-service-permissive-mtls
@@ -37,20 +42,22 @@ spec:
 
 ---
 # ── AuthorizationPolicy: deny all by default (zero-trust baseline) ────────────
-# An empty spec with action DENY and no rules denies nothing;
-# a missing AuthorizationPolicy allows everything.
-# The pattern for zero-trust: one DENY-all + explicit ALLOW policies.
-apiVersion: security.istio.io/v1beta1
+# With NO AuthorizationPolicy at all, everything is allowed. As soon as one ALLOW
+# policy selects a workload, only what some ALLOW policy matches is let through.
+# An ALLOW policy with an empty spec has no rule that can match, so it allows
+# nothing: that is the namespace-wide deny-all baseline. Explicit ALLOW policies
+# below then open the paths you want.
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: deny-all-default
   namespace: production
 spec:
-  {}   # empty spec = deny all traffic to all workloads in this namespace
+  {}   # no selector, no rules: nothing is allowed to any workload in this namespace
 
 ---
 # ── AuthorizationPolicy: allow ingress gateway to reach app-service ───────────
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: allow-ingress-to-app
@@ -65,7 +72,7 @@ spec:
         # Only the ingress gateway's service account may call this service
         - source:
             principals:
-              - "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
+              - "cluster.local/ns/istio-system/sa/istio-ingressgateway"      # SA created by the gateway chart (l1c)
       to:
         - operation:
             methods: ["GET", "POST"]
@@ -74,7 +81,7 @@ spec:
 ---
 # ── AuthorizationPolicy: service-to-service RBAC ─────────────────────────────
 # api-service may call reviews-service; nothing else can
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: reviews-allow-api-service
@@ -98,16 +105,12 @@ spec:
             methods: ["GET"]
             paths: ["/api/reviews*"]
             ports: ["8080"]
-      when:
-        # Condition: only allow if request has valid header
-        - key: request.headers[x-internal-token]
-          values: ["allowed"]
 
 ---
 # ── AuthorizationPolicy: JWT end-user authentication ─────────────────────────
 # Validates JWT from Authorization: Bearer <token> header
 # Requires RequestAuthentication to be defined first (see below)
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: require-jwt-for-api
@@ -133,7 +136,7 @@ spec:
 ---
 # ── RequestAuthentication: define valid JWT issuers ──────────────────────────
 # Must be defined alongside AuthorizationPolicy that checks requestPrincipals
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: RequestAuthentication
 metadata:
   name: api-jwt-auth
@@ -148,11 +151,12 @@ spec:
       jwksUri: "https://auth.example.com/.well-known/jwks.json"
       audiences:
         - "api.example.com"
-      # Cache JWKS for 5 minutes (reduce latency)
-      jwksRefreshInterval: 300s
-      # Forward validated JWT to backend (for logging/audit)
+      # JWKS cache refresh is NOT a field here: it is set on istiod with the
+      # PILOT_JWT_PUB_KEY_REFRESH_INTERVAL environment variable.
+      # Forward the validated JWT to the backend (for logging/audit)
       forwardOriginalToken: true
-      # Claim that becomes the request principal
+      # Copy claims into request headers for the app (this does not create the
+      # request principal: that is always <issuer>/<sub>)
       outputClaimToHeaders:
         - header: x-jwt-sub
           claim: sub
@@ -167,7 +171,7 @@ spec:
 
 ---
 # ── AuthorizationPolicy: admin namespace full access for ops team ─────────────
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: allow-ops-namespace-full-access
@@ -177,8 +181,9 @@ spec:
   action: ALLOW
   rules:
     - from:
+        # Fields inside ONE source are ANDed (a namespace AND a principal would
+        # have to match together), so list the identities and let the list OR.
         - source:
-            namespaces: ["ops", "monitoring"]
             principals:
               - "cluster.local/ns/ops/sa/prometheus"
               - "cluster.local/ns/monitoring/sa/grafana"

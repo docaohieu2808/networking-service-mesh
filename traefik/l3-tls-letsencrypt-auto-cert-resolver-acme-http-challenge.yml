@@ -1,91 +1,129 @@
-# Traefik L3 — Automatic TLS with Let's Encrypt (ACME HTTP-01 challenge)
-# Demonstrates: certificatesResolvers, ACME http-challenge, cert storage, TLS options
-# Requirements:
-#   - Public DNS pointing to this host
-#   - Port 80 reachable from internet for HTTP-01 challenge
-#   - Replace all example.com / admin@example.com values
-# Usage: docker compose -f l3-tls-letsencrypt-auto-cert-resolver-acme-http-challenge.yml up -d
-
-version: "3.9"
+# Traefik L3 - Automatic TLS with Let's Encrypt (ACME)
+# Demonstrates: certificatesResolvers with HTTP-01 (single host) and DNS-01
+#               (the only way to get a wildcard), cert storage, TLS options
+#               from the file provider.
+# Requirements for a REAL certificate:
+#   - public DNS for your domain pointing at this host
+#   - port 80 reachable from the internet (HTTP-01)
+#   - for the wildcard: a DNS provider API token in $CF_DNS_API_TOKEN (Cloudflare shown)
+#   - replace every example.com / admin@example.com
+# The resolvers default to the Let's Encrypt STAGING CA (no rate-limit trouble,
+# untrusted certs). For production: export ACME_CA_SERVER=https://acme-v02.api.letsencrypt.org/directory
+# Usage:
+#   export CF_DNS_API_TOKEN=...            # DNS-01 only; any string is fine for HTTP-01 labs
+#   docker compose -f l3-tls-letsencrypt-auto-cert-resolver-acme-http-challenge.yml up -d --wait
 
 services:
   traefik:
-    image: traefik:v3.0
+    image: traefik:v3.7.16
     container_name: traefik-l3
     restart: unless-stopped
     command:
       - "--log.level=INFO"
       - "--accesslog=true"
+      - "--global.checkNewVersion=false"
+      - "--ping=true"
       - "--api.dashboard=true"
+      - "--api.insecure=true"          # lab convenience; published on loopback only below
 
       # --- EntryPoints ---
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
+      # --- Entry point hardening (Traefik 3.7 warns when these are unset) ---
+      - "--entrypoints.web.http.aliasHeadersStrategy=delete"
+      - "--entrypoints.web.http.encodedCharacters.allowEncodedSlash=false"
+      - "--entrypoints.web.http.encodedCharacters.allowEncodedBackSlash=false"
+      - "--entrypoints.web.http.encodedCharacters.allowEncodedNullCharacter=false"
+      # --- Same hardening on the TLS entry point ---
+      - "--entrypoints.websecure.http.aliasHeadersStrategy=delete"
+      - "--entrypoints.websecure.http.encodedCharacters.allowEncodedSlash=false"
+      - "--entrypoints.websecure.http.encodedCharacters.allowEncodedBackSlash=false"
+      - "--entrypoints.websecure.http.encodedCharacters.allowEncodedNullCharacter=false"
 
-      # Global HTTP→HTTPS redirect
+      # Global HTTP -> HTTPS redirect
       - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
       - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
       - "--entrypoints.web.http.redirections.entryPoint.permanent=true"
 
-      # --- Certificate Resolver: Let's Encrypt (HTTP-01) ---
+      # --- Resolver 1: Let's Encrypt HTTP-01 (one certificate per hostname) ---
       - "--certificatesresolvers.letsencrypt.acme.email=admin@example.com"
       - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.caserver=${ACME_CA_SERVER:-https://acme-staging-v02.api.letsencrypt.org/directory}"
       - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
 
-      # Use staging CA during testing to avoid rate limits; remove for production:
-      # - "--certificatesresolvers.letsencrypt.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory"
+      # --- Resolver 2: Let's Encrypt DNS-01 (required for *.example.com) ---
+      - "--certificatesresolvers.letsencrypt-dns.acme.email=admin@example.com"
+      - "--certificatesresolvers.letsencrypt-dns.acme.storage=/letsencrypt/acme-dns.json"
+      - "--certificatesresolvers.letsencrypt-dns.acme.caserver=${ACME_CA_SERVER:-https://acme-staging-v02.api.letsencrypt.org/directory}"
+      - "--certificatesresolvers.letsencrypt-dns.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.letsencrypt-dns.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53"
 
-      # --- Certificate Resolver: Let's Encrypt (DNS-01 via env vars) ---
-      # Uncomment and set provider env vars for wildcard certs:
-      # - "--certificatesresolvers.letsencrypt-dns.acme.email=admin@example.com"
-      # - "--certificatesresolvers.letsencrypt-dns.acme.storage=/letsencrypt/acme-dns.json"
-      # - "--certificatesresolvers.letsencrypt-dns.acme.dnschallenge.provider=cloudflare"
-      # - "--certificatesresolvers.letsencrypt-dns.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53"
-
-      # --- TLS Options: enforce minimum TLS 1.2, strong ciphers ---
+      # --- Providers ---
       - "--providers.docker=true"
+      - "--providers.docker.endpoint=tcp://docker-socket-proxy:2375"
       - "--providers.docker.exposedByDefault=false"
       - "--providers.docker.network=traefik_net"
-
-      # File provider for static TLS options (see below via volume)
+      # File provider: the `hardened` TLS option set referenced by the routers
       - "--providers.file.filename=/config/tls-options.yml"
       - "--providers.file.watch=true"
     ports:
       - "80:80"
       - "443:443"
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "letsencrypt_data:/letsencrypt"
       - "./tls-options-static-config.yml:/config/tls-options.yml:ro"
     environment:
-      # Required for DNS-01 Cloudflare (only needed if using DNS challenge):
-      # CF_DNS_API_TOKEN: "${CF_DNS_API_TOKEN}"
-      DUMMY: "placeholder"
+      CF_DNS_API_TOKEN: "${CF_DNS_API_TOKEN:?export CF_DNS_API_TOKEN (the DNS-01 resolver reads it)}"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      - docker-socket-proxy
     networks:
       - traefik_net
+      - socket_net
 
-  # Backend service with automatic TLS
+  # The Docker socket is root-equivalent even when mounted :ro (the API still
+  # accepts writes). Traefik talks to a filtering proxy that only allows the
+  # read endpoints its Docker provider needs, on a network nothing else joins.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"     # list/inspect containers (labels)
+      NETWORKS: "1"       # resolve container IPs per network
+      EVENTS: "1"         # watch start/stop
+      POST: "0"           # no write calls at all
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - socket_net
+
+
+  # Single hostname: HTTP-01
   webapp:
-    image: traefik/whoami
+    image: traefik/whoami:v1.12.0
     container_name: webapp-l3
     restart: unless-stopped
     labels:
       - "traefik.enable=true"
-      # HTTPS router with auto-cert
       - "traefik.http.routers.webapp.entrypoints=websecure"
       - "traefik.http.routers.webapp.rule=Host(`app.example.com`)"
       - "traefik.http.routers.webapp.tls=true"
       - "traefik.http.routers.webapp.tls.certresolver=letsencrypt"
-      # Enforce hardened TLS options defined in file provider
+      # Enforce hardened TLS options defined in the file provider
       - "traefik.http.routers.webapp.tls.options=hardened@file"
       - "traefik.http.services.webapp.loadbalancer.server.port=80"
     networks:
       - traefik_net
 
-  # Wildcard cert example (requires DNS-01 resolver)
+  # Wildcard certificate: only DNS-01 can issue it, so this router uses the
+  # letsencrypt-dns resolver (HTTP-01 can never validate *.example.com).
   api:
-    image: traefik/whoami
+    image: traefik/whoami:v1.12.0
     container_name: api-l3
     restart: unless-stopped
     labels:
@@ -93,8 +131,8 @@ services:
       - "traefik.http.routers.api.entrypoints=websecure"
       - "traefik.http.routers.api.rule=Host(`api.example.com`)"
       - "traefik.http.routers.api.tls=true"
-      # For wildcard: switch to letsencrypt-dns resolver
-      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt-dns"
+      - "traefik.http.routers.api.tls.options=hardened@file"
       - "traefik.http.routers.api.tls.domains[0].main=example.com"
       - "traefik.http.routers.api.tls.domains[0].sans=*.example.com"
       - "traefik.http.services.api.loadbalancer.server.port=80"
@@ -109,3 +147,5 @@ networks:
   traefik_net:
     name: traefik_net
     driver: bridge
+  socket_net:
+    internal: true      # only traefik and the socket proxy are attached

@@ -1,42 +1,45 @@
-# Istio L-MAX — EnvoyFilter: WASM extension + Lua HTTP filter + custom cluster
-# Demonstrates: EnvoyFilter patching at LISTENER/HTTP_FILTER/CLUSTER level,
-#               inline Lua filter, WASM plugin via WasmPlugin CR (Istio 1.12+),
-#               custom Envoy cluster for external auth, header manipulation
+# Istio L-MAX - Extensibility: WasmPlugin, EnvoyFilter (Lua), external authorization
+# Demonstrates: the supported extension points in order of preference
+#   1. AuthorizationPolicy action CUSTOM + meshConfig.extensionProviders  (external authz)
+#   2. WasmPlugin                                                        (compiled filters; l-max-wasm-plugin-oci-module-placeholder.yaml)
+#   3. EnvoyFilter                                                       (raw Envoy patches, last resort)
+# EnvoyFilter has no compatibility guarantee: Envoy internals change between
+# Istio releases, so keep every EnvoyFilter small and re-test it on each upgrade.
 #
+# Prereq: istiod installed with the Helm values in l1 (they declare the
+#         `ext-authz-grpc` extension provider used below); namespace production
+#         labeled istio-injection=enabled.
 # Apply: kubectl apply -f l-max-envoy-filter-wasm-custom-lua-http-filter.yaml
-# Prereq: Istio >= 1.12 for WasmPlugin CR; EnvoyFilter works on any version.
+# CI applies the Lua EnvoyFilter on a real sidecar and checks the response header.
 
 ---
-# ── WasmPlugin CR (preferred over EnvoyFilter for WASM in Istio 1.12+) ───────
-# Loads a WASM module from OCI registry into all matched sidecars.
-# Build your own: https://github.com/proxy-wasm/proxy-wasm-go-sdk
-apiVersion: extensions.istio.io/v1alpha1
-kind: WasmPlugin
+# ── External authorization the supported way ─────────────────────────────────
+# The provider (name, gRPC service, timeout, failOpen: false) is declared once in
+# meshConfig.extensionProviders. This policy sends matching requests to it.
+# The earlier version of this file hand-wrote an ext_authz EnvoyFilter plus a raw
+# cluster; this replaces both.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
 metadata:
-  name: custom-auth-wasm-plugin
-  namespace: production
+  name: ingress-ext-authz
+  namespace: istio-system
 spec:
   selector:
     matchLabels:
-      app: api-service
-  url: oci://ghcr.io/example/custom-auth-filter:v1.2.0
-  # sha256: abc123...  # pin digest for production
-  phase: AUTHN          # UNSPECIFIED_PHASE | AUTHN | AUTHZ | STATS
-  priority: 10          # lower = runs earlier within same phase
-  pluginConfig:
-    # Arbitrary config passed to the WASM module via OnConfigure()
-    auth_service_url: "http://auth-service.production.svc.cluster.local:8080"
-    cache_ttl_seconds: 300
-    bypass_paths:
-      - "/health"
-      - "/metrics"
-  imagePullPolicy: IfNotPresent
-  # imagePullSecret: wasm-registry-secret  # for private OCI registries
+      istio: ingressgateway
+  action: CUSTOM
+  provider:
+    name: ext-authz-grpc
+  rules:
+    - to:
+        - operation:
+            notPaths: ["/health", "/metrics"]     # no external call for probes and scrapes
 
 ---
-# ── EnvoyFilter: inject inline Lua HTTP filter into inbound listener ──────────
-# Runs Lua script in every request through the api-service sidecar proxy.
-# Use for: header manipulation, logging, simple auth checks without WASM overhead.
+# ── EnvoyFilter: inline Lua HTTP filter on the inbound listener ──────────────
+# Runs a Lua script for every request that reaches api-service (port 8080).
+# Use it for small header tweaks that no Istio API covers; reach for WasmPlugin
+# when the logic grows.
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
@@ -47,7 +50,6 @@ spec:
     labels:
       app: api-service
   configPatches:
-    # Patch the HTTP connection manager on inbound (virtual inbound) listener
     - applyTo: HTTP_FILTER
       match:
         context: SIDECAR_INBOUND          # SIDECAR_INBOUND | SIDECAR_OUTBOUND | GATEWAY
@@ -59,31 +61,25 @@ spec:
               subFilter:
                 name: envoy.filters.http.router
       patch:
-        operation: INSERT_BEFORE          # insert before the router filter
+        operation: INSERT_BEFORE          # run before the router filter
         value:
+          # One filter, one typed_config. (Listing `name` and `typed_config` twice,
+          # as an earlier version did, is a duplicate YAML key and is rejected.)
           name: envoy.filters.http.lua
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.LuaPerRoute
-          # Inline Lua script executed per request
-          # Note: for INSERT_BEFORE on HTTP_FILTER, use LuaPerRoute or envoy_lua
-          name: envoy.lua
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
             inline_code: |
               function envoy_on_request(request_handle)
-                -- Generate or propagate request ID
+                -- Make sure every request carries an id (Envoy normally sets x-request-id itself)
                 local req_id = request_handle:headers():get("x-request-id")
                 if not req_id or req_id == "" then
-                  -- Simple pseudo-random ID (use WASM for crypto-quality UUID)
-                  local ts = tostring(os.time())
-                  request_handle:headers():replace("x-request-id", "lua-" .. ts)
+                  request_handle:headers():replace("x-request-id", "lua-" .. tostring(os.time()))
                 end
 
-                -- Remove sensitive headers before forwarding to app
+                -- Strip headers that must never come from a client
                 request_handle:headers():remove("x-internal-debug")
                 request_handle:headers():remove("x-admin-bypass")
 
-                -- Log request metadata
                 request_handle:logInfo(string.format(
                   "LUA: method=%s path=%s id=%s",
                   request_handle:headers():get(":method"),
@@ -93,89 +89,15 @@ spec:
               end
 
               function envoy_on_response(response_handle)
-                -- Inject server-timing header for observability
-                local status = response_handle:headers():get(":status")
                 response_handle:headers():replace("x-served-by", "envoy-lua")
-                -- Remove upstream server identity
                 response_handle:headers():remove("server")
                 response_handle:headers():remove("x-powered-by")
               end
 
 ---
-# ── EnvoyFilter: add custom external authorization cluster ────────────────────
-# Adds a raw Envoy cluster config that Istio doesn't expose natively.
-# Used to point ext_authz filter at an out-of-mesh gRPC auth service.
-apiVersion: networking.istio.io/v1alpha3
-kind: EnvoyFilter
-metadata:
-  name: ext-authz-cluster
-  namespace: istio-system    # cluster-scoped when in istio-system
-spec:
-  configPatches:
-    - applyTo: CLUSTER
-      match:
-        context: ANY
-      patch:
-        operation: ADD
-        value:
-          name: ext_authz_cluster
-          type: STRICT_DNS
-          connect_timeout: 2s
-          http2_protocol_options: {}     # force HTTP/2 for gRPC
-          load_assignment:
-            cluster_name: ext_authz_cluster
-            endpoints:
-              - lb_endpoints:
-                  - endpoint:
-                      address:
-                        socket_address:
-                          address: auth-grpc.production.svc.cluster.local
-                          port_value: 9001
-
----
-# ── EnvoyFilter: enable ext_authz HTTP filter on gateway ─────────────────────
-apiVersion: networking.istio.io/v1alpha3
-kind: EnvoyFilter
-metadata:
-  name: gateway-ext-authz-filter
-  namespace: istio-system
-spec:
-  workloadSelector:
-    labels:
-      istio: ingressgateway
-  configPatches:
-    - applyTo: HTTP_FILTER
-      match:
-        context: GATEWAY
-        listener:
-          filterChain:
-            filter:
-              name: envoy.filters.network.http_connection_manager
-              subFilter:
-                name: envoy.filters.http.router
-      patch:
-        operation: INSERT_BEFORE
-        value:
-          name: envoy.filters.http.ext_authz
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
-            grpc_service:
-              envoy_grpc:
-                cluster_name: ext_authz_cluster
-              timeout: 2s
-            failure_mode_allow: false    # deny on auth service failure (fail-closed)
-            with_request_body:
-              max_request_bytes: 8192
-              allow_partial_message: true
-            # Headers from auth service response to forward to upstream
-            allowed_headers:
-              patterns:
-                - exact: x-user-id
-                - exact: x-user-role
-                - prefix: x-auth-
-
----
-# ── EnvoyFilter: HTTP connection manager tuning ───────────────────────────────
+# ── EnvoyFilter: HTTP connection manager tuning ──────────────────────────────
+# Istio already enables normalize_path and merge_slashes by default, so only
+# settings Istio does not expose are patched here.
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
@@ -199,18 +121,4 @@ spec:
         value:
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-            # Increase max request headers size (default 60KB)
-            max_request_headers_kb: 96
-            # Enable HTTP/2 server-side
-            http2_protocol_options:
-              max_concurrent_streams: 100
-              initial_stream_window_size: 65536
-            # Normalize paths (decode %2F etc.) before routing
-            normalize_path: true
-            # Merge slashes in path
-            merge_slashes: true
-            # Request ID generation
-            request_id_extension:
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.request_id.uuid.v3.UuidRequestIdConfig
-                use_request_id_for_trace_sampling: true
+            max_request_headers_kb: 96        # default 60

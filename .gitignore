@@ -25,11 +25,6 @@ Thumbs.db
 .env.*
 secrets.yaml
 *-secret.yaml
-blacklist.lst
-scanner-agents.lst
 
-# Traefik dynamic config dir (generated at runtime)
-traefik/dynamic/
-
-# HAProxy generated files
-haproxy/*.lst
+# Lab certificates written by linkerd/gen-certs.sh
+certs/

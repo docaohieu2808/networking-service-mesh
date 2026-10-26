@@ -1,0 +1,50 @@
+# Istio L1b - IstioOperator for `istioctl install` (classic sidecar install)
+# This kind of file is for istioctl ONLY. Do not pass it to `helm -f`: Helm has
+# no apiVersion/kind/spec values and would ignore every line of it.
+#
+#   istioctl install -f l1b-istiooperator-sidecar-install-istioctl.yaml --skip-confirmation
+#   istioctl manifest generate -f l1b-istiooperator-sidecar-install-istioctl.yaml   # render offline (CI does this)
+#
+# Note: IstioOperator is still supported as an *istioctl input*; the in-cluster
+# operator controller is removed. For GitOps prefer the Helm route (l1).
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: istio-control-plane
+  namespace: istio-system
+spec:
+  # profile: minimal | default | demo | empty | ambient
+  # minimal: istiod only, no gateways. default: istiod + ingress gateway.
+  profile: minimal
+
+  meshConfig:
+    accessLogFile: /dev/stdout
+    accessLogEncoding: JSON
+    enablePrometheusMerge: true
+    defaultConfig:
+      holdApplicationUntilProxyStarts: true
+    outboundTrafficPolicy:
+      mode: REGISTRY_ONLY
+
+  components:
+    pilot:
+      k8s:
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            memory: 1Gi
+        hpaSpec:
+          minReplicas: 2
+          maxReplicas: 5
+        podDisruptionBudget:
+          minAvailable: 1
+
+  values:
+    global:
+      proxy:
+        logLevel: warning
+    sidecarInjectorWebhook:
+      enableNamespacesByDefault: false
+      rewriteAppHTTPProbe: true

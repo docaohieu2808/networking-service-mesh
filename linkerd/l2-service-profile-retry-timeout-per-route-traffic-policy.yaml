@@ -1,75 +1,23 @@
-# Linkerd L2 — ServiceProfile: per-route retries, timeouts, traffic policy
-# Demonstrates: ServiceProfile CRD, route definitions, retry budgets,
-#               HTTPRoute (Gateway API), Server + AuthorizationPolicy (policy.linkerd.io)
+# Linkerd L2 - Per-route retries and timeouts, traffic split, and mTLS-based policy
+# Demonstrates: ServiceProfile (the classic way), Gateway API HTTPRoute with
+#               retry/timeout annotations (the current way), Server +
+#               AuthorizationPolicy + MeshTLSAuthentication (policy.linkerd.io).
 #
-# Apply: kubectl apply -f l2-service-profile-retry-timeout-per-route-traffic-policy.yaml
-# Prereq: Linkerd control plane installed, namespace injection enabled
+# Prereqs: l1 installed (CRD chart with installGatewayAPI=true, or Gateway API CRDs
+#          already on the cluster), namespace production from l1b.
+# Apply:   kubectl apply -f l2-service-profile-retry-timeout-per-route-traffic-policy.yaml
+#
+# Two different services are used on purpose. When an HTTPRoute exists for a
+# Service, Linkerd uses it and ignores that Service's ServiceProfile, so mixing the
+# two on the same Service just hides one of them:
+#   reviews-service -> ServiceProfile (legacy; still supported, gives per-route metrics)
+#   api-service     -> HTTPRoute + annotations (recommended for new work)
+# TrafficSplit (SMI) is gone: SMI support was removed from Linkerd, use HTTPRoute weights.
 
 ---
-# ── ServiceProfile: per-route observability + retry/timeout config ────────────
-# Linkerd uses ServiceProfile to classify requests into named routes,
-# enabling per-route golden metrics (success rate, latency, RPS) in linkerd-viz.
-apiVersion: linkerd.io/v1alpha2
-kind: ServiceProfile
-metadata:
-  name: api-service.production.svc.cluster.local
-  namespace: production        # must be in the CLIENT namespace (caller side)
-spec:
-  # Routes define how to classify inbound/outbound requests
-  routes:
-    # ── GET /api/users — read endpoint, safe to retry ─────────────────────────
-    - name: GET /api/users
-      condition:
-        method: GET
-        pathRegex: /api/users(/.*)?
-      # Timeout for this specific route (overrides global proxy timeout)
-      timeout: 5s
-      # Retries: only safe for idempotent requests (GET, HEAD)
-      isRetryable: true
-
-    # ── GET /api/users/{id} — single resource fetch ───────────────────────────
-    - name: GET /api/users/{id}
-      condition:
-        method: GET
-        pathRegex: /api/users/[^/]+$
-      timeout: 3s
-      isRetryable: true
-
-    # ── POST /api/users — write endpoint, NOT retryable (avoid duplicate writes)
-    - name: POST /api/users
-      condition:
-        method: POST
-        pathRegex: /api/users
-      timeout: 10s
-      isRetryable: false       # explicit: never retry POST
-
-    # ── GET /api/reports — slow report generation, longer timeout ────────────
-    - name: GET /api/reports
-      condition:
-        method: GET
-        pathRegex: /api/reports(/.*)?
-      timeout: 30s
-      isRetryable: true
-
-    # ── /health — exclude from metrics to reduce noise ────────────────────────
-    - name: GET /health
-      condition:
-        method: GET
-        pathRegex: /health(z)?
-      timeout: 2s
-      isRetryable: false
-
-  # Retry budget: limits total retry load to prevent retry storms
-  # retryBudget applies to ALL retryable routes combined
-  retryBudget:
-    retryRatio: 0.2            # allow up to 20% of requests to be retries
-    minRetriesPerSecond: 10    # always allow at least 10 retries/s (for low-traffic)
-    ttl: 10s                   # sliding window for ratio calculation
-
----
-# ── ServiceProfile: for a downstream dependency (outbound profile) ────────────
-# When api-service calls reviews-service, this profile applies on the client side.
-# Place in the CALLER's namespace to control outbound traffic shape.
+# ── ServiceProfile: per-route metrics, timeouts and retries for reviews-service ─
+# Lives in the CLIENT namespace (the caller's side) and is named after the
+# service FQDN. Routes classify requests so linkerd-viz shows golden metrics per route.
 apiVersion: linkerd.io/v1alpha2
 kind: ServiceProfile
 metadata:
@@ -82,24 +30,26 @@ spec:
         method: GET
         pathRegex: /reviews(/.*)?
       timeout: 3s
-      isRetryable: true
+      isRetryable: true          # idempotent read: safe to retry
 
     - name: POST /reviews
       condition:
         method: POST
         pathRegex: /reviews
       timeout: 8s
-      isRetryable: false
+      isRetryable: false         # never retry a write: duplicate reviews
 
+  # Caps retry load across all retryable routes to prevent retry storms
   retryBudget:
-    retryRatio: 0.15
-    minRetriesPerSecond: 5
+    retryRatio: 0.2              # retries may add up to 20% extra requests
+    minRetriesPerSecond: 10      # always allow some retries on low traffic
     ttl: 10s
 
 ---
-# ── Server: define inbound policy for api-service (Linkerd policy API) ────────
-# Server selects which pods + port are governed by this policy.
-# Requires Linkerd >= 2.12 and policy controller.
+# ── Server: which pods/port the inbound policy applies to ────────────────────
+# Once a Server selects a port, ONLY traffic matched by an AuthorizationPolicy is
+# allowed (the Helm default policy no longer applies to it). Kubelet probes to the
+# paths in the pod's probes are authorized automatically by the policy controller.
 apiVersion: policy.linkerd.io/v1beta3
 kind: Server
 metadata:
@@ -110,10 +60,25 @@ spec:
     matchLabels:
       app: api-service
   port: 8080
-  proxyProtocol: HTTP/2     # HTTP/1, HTTP/2, gRPC, opaque, TLS, unknown
+  proxyProtocol: HTTP/1        # must match what the app speaks: HTTP/1 | HTTP/2 | gRPC | opaque | TLS
 
 ---
-# ── AuthorizationPolicy: allow only specific clients to reach api-service ─────
+# ── MeshTLSAuthentication: "this exact ServiceAccount identity" ───────────────
+# Use identityRefs OR identities, not both (the schema accepts exactly one).
+# A wildcard identity such as "*.production.serviceaccount.identity.linkerd..."
+# would admit EVERY service account in the namespace, not just the frontend.
+apiVersion: policy.linkerd.io/v1alpha1
+kind: MeshTLSAuthentication
+metadata:
+  name: frontend-sa-authn
+  namespace: production
+spec:
+  identityRefs:
+    - kind: ServiceAccount
+      name: frontend-service
+
+---
+# ── AuthorizationPolicy: only the frontend may call api-service ──────────────
 apiVersion: policy.linkerd.io/v1alpha1
 kind: AuthorizationPolicy
 metadata:
@@ -124,45 +89,36 @@ spec:
     group: policy.linkerd.io
     kind: Server
     name: api-service-http
-  # Allow traffic from these service accounts (mTLS identity)
   requiredAuthenticationRefs:
     - name: frontend-sa-authn
       kind: MeshTLSAuthentication
       group: policy.linkerd.io
 
 ---
-# ── MeshTLSAuthentication: frontend service account identity ─────────────────
-apiVersion: policy.linkerd.io/v1alpha1
-kind: MeshTLSAuthentication
-metadata:
-  name: frontend-sa-authn
-  namespace: production
-spec:
-  identities:
-    # SPIFFE identity of the frontend service account
-    - "*.production.serviceaccount.identity.linkerd.cluster.local"
-  identityRefs:
-    - kind: ServiceAccount
-      name: frontend-service
-      namespace: production
-
----
-# ── HTTPRoute (Gateway API): fine-grained L7 routing with Linkerd ────────────
-# Linkerd supports Gateway API HTTPRoute for advanced routing (>= 2.13).
-# Requires: kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/...
-apiVersion: gateway.networking.k8s.io/v1beta1
+# ── HTTPRoute (Gateway API v1): canary split plus retries/timeouts ───────────
+# Retries and timeouts are annotations on the route (or on the Service):
+#   retry.linkerd.io/http   - which status classes to retry (5xx, gateway-error, ...)
+#   retry.linkerd.io/limit  - max retries per request
+#   timeout.linkerd.io/request - total request timeout
+# Linkerd's Gateway API CRDs are bundle v1.1.1, which serves HTTPRoute v1.
+apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: api-service-routes
   namespace: production
+  annotations:
+    retry.linkerd.io/http: "5xx"
+    retry.linkerd.io/limit: "2"
+    retry.linkerd.io/timeout: "2s"
+    timeout.linkerd.io/request: "10s"
 spec:
   parentRefs:
     - name: api-service
       kind: Service
-      group: core
+      group: ""                 # core API group
       port: 8080
   rules:
-    # Route /api/v2/* to the v2 backend (canary)
+    # /api/v2/* always goes to the new version
     - matches:
         - path:
             type: PathPrefix
@@ -170,9 +126,7 @@ spec:
       backendRefs:
         - name: api-service-v2
           port: 8080
-          weight: 100
-
-    # Route /api/v1/* to stable backend
+    # /api/v1/* always goes to the stable version
     - matches:
         - path:
             type: PathPrefix
@@ -180,9 +134,7 @@ spec:
       backendRefs:
         - name: api-service-v1
           port: 8080
-          weight: 100
-
-    # Default: 90/10 split between stable and canary
+    # Everything else: 90/10 canary
     - backendRefs:
         - name: api-service-v1
           port: 8080
@@ -190,3 +142,80 @@ spec:
         - name: api-service-v2
           port: 8080
           weight: 10
+
+---
+# ── Lab backends so the objects above point at something real ────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: frontend-service
+  namespace: production
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service-v1
+  namespace: production
+spec:
+  selector: {app: api-service-lab, version: v1}
+  ports: [{name: http, port: 8080, targetPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service-v2
+  namespace: production
+spec:
+  selector: {app: api-service-lab, version: v2}
+  ports: [{name: http, port: 8080, targetPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reviews-service
+  namespace: production
+spec:
+  selector: {app: api-service-lab, version: v1}
+  ports: [{name: http, port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service-v1
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: api-service-lab, version: v1}
+  template:
+    metadata:
+      labels: {app: api-service-lab, version: v1}
+    spec:
+      containers:
+        - name: app
+          image: traefik/whoami:v1.12.0
+          args: ["--port", "8080", "--name", "v1"]
+          ports: [{containerPort: 8080}]
+          securityContext: {allowPrivilegeEscalation: false, runAsNonRoot: true, runAsUser: 10001, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 64Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service-v2
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: api-service-lab, version: v2}
+  template:
+    metadata:
+      labels: {app: api-service-lab, version: v2}
+    spec:
+      containers:
+        - name: app
+          image: traefik/whoami:v1.12.0
+          args: ["--port", "8080", "--name", "v2"]
+          ports: [{containerPort: 8080}]
+          securityContext: {allowPrivilegeEscalation: false, runAsNonRoot: true, runAsUser: 10001, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 64Mi}}

@@ -1,0 +1,79 @@
+# Lab fixtures for the l2 checks (used by CI, runnable by hand).
+# frontend runs as the ServiceAccount the MeshTLSAuthentication names; other runs
+# as the namespace's default ServiceAccount. api-service-direct is a second Service
+# for the same pods, with no HTTPRoute, so requests really reach the api-service
+# pods and meet the Server/AuthorizationPolicy (via the api-service Service they
+# are rerouted by the HTTPRoute to the v1/v2 backends and never get there).
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service-direct
+  namespace: production
+spec:
+  selector:
+    app: api-service
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      serviceAccountName: frontend-service
+      containers:
+        - name: curl
+          image: curlimages/curl:8.23.0
+          command: ["sleep", "3600"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: other
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: other
+  template:
+    metadata:
+      labels:
+        app: other
+    spec:
+      containers:
+        - name: curl
+          image: curlimages/curl:8.23.0
+          command: ["sleep", "3600"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi

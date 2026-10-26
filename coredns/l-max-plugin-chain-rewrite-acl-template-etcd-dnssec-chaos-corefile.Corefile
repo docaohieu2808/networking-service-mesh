@@ -1,15 +1,22 @@
-# CoreDNS L-MAX — Custom plugin config: rewrite, chaos, etcd, template, acl, dnssec
-# Demonstrates: query rewriting, DNS chaos (version endpoint), etcd-backed service
-#               discovery, template plugin for pattern-based responses, ACL, DNSSEC signing
+# CoreDNS L-MAX - Plugin chain: rewrite, acl, template, etcd, dnssec, chaos
+# Demonstrates: query rewriting, ACLs, synthetic answers with the template
+#               plugin, etcd-backed service discovery, online DNSSEC signing,
+#               CHAOS identity queries.
+# (No custom-built plugin here: every plugin below ships in the stock image.
+#  Building your own means adding it to plugin.cfg and recompiling CoreDNS.)
 #
-# Usage:
-#   docker run --rm \
-#     -v $(pwd)/l-max-custom-plugin-rewrite-chaos-etcd-corefile.Corefile:/Corefile:ro \
-#     -p 53:53/udp -p 53:53/tcp \
-#     coredns/coredns:latest -plugins   # verify plugins compiled in
+# PLUGIN ORDER: the order of lines inside a server block does NOT decide the
+# order plugins run. That is fixed when CoreDNS is compiled (plugin.cfg in the
+# CoreDNS source tree): metadata -> ... -> rewrite -> acl -> ... -> template ->
+# ... -> etcd -> ... The lines below are grouped for reading, not for ordering.
+# `coredns -plugins` lists what a binary contains.
 #
-# Note: etcd and dnssec plugins must be compiled into the CoreDNS binary.
-#       Use the coredns/coredns image or build with custom plugin.cfg.
+# Run it (dnssec needs a key; ./test.sh generates one with ldns-keygen):
+#   mkdir keys && ldns-keygen -a ECDSAP256SHA256 -k -r /dev/urandom example.com && mv Kexample.com.* keys/
+#   docker run --rm -v $PWD/<this file>:/Corefile:ro -v $PWD/keys:/etc/coredns/keys:ro \
+#     -p 1053:53/udp -p 1053:53/tcp coredns/coredns:1.15.0 -conf /Corefile
+#   dig @127.0.0.1 -p 1053 svc-7.dynamic.example.com +short     # 10.0.0.7
+#   dig @127.0.0.1 -p 1053 version.bind TXT CH +short
 
 # ── Zone with full plugin stack ───────────────────────────────────────────────
 example.com:53 {
@@ -19,11 +26,8 @@ example.com:53 {
     # ── ACL: block queries from untrusted networks ────────────────────────────
     # Allow RFC-1918 ranges + localhost; block everything else
     acl {
-        allow net 127.0.0.0/8
-        allow net 10.0.0.0/8
-        allow net 172.16.0.0/12
-        allow net 192.168.0.0/16
-        block
+        allow net 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+        block net *
     }
 
     # ── Rewrite: canonical CNAME flattening ──────────────────────────────────
@@ -43,12 +47,9 @@ example.com:53 {
         fallthrough
     }
 
-    # Wildcard catch-all for *.example.com → returns fixed IP
-    template IN A example.com {
-        match "^.*\.example\.com\.$"
-        answer "{{ .Name }} 30 IN A 93.184.216.34"
-        fallthrough
-    }
+    # NOTE: do not add a catch-all like `template IN A example.com { match ".*" }`.
+    # It would answer every name itself and the etcd records below would never
+    # be consulted (a `fallthrough` only helps when the template does not match).
 
     # ── etcd: dynamic service registration ───────────────────────────────────
     # Services register themselves in etcd under /skydns/com/example/
@@ -58,8 +59,7 @@ example.com:53 {
         endpoint http://etcd:2379
         # Key prefix in etcd where service records are stored
         path /skydns
-        # Upstream for records not found in etcd
-        upstream 1.1.1.1:53
+        fallthrough
         # TLS config (uncomment for production etcd with TLS):
         # tls /etc/coredns/etcd-client.crt /etc/coredns/etcd-client.key /etc/coredns/etcd-ca.crt
     }
@@ -89,23 +89,22 @@ example.com:53 {
 # dig @127.0.0.1 version.bind TXT CHAOS
 # dig @127.0.0.1 version.server TXT CHAOS
 .:53 {
-    # chaos version.bind / version.server → returns custom string
-    chaos "CoreDNS-custom v1.0" info@example.com
+    # chaos answers version.bind / version.server. A custom string avoids
+    # advertising the real version; restrict it (acl) on resolvers facing the internet.
+    chaos "lab-dns" ops@example.com
 
     errors
 
     # ── Rewrite: redirect legacy hostnames before forwarding ──────────────────
     rewrite name old-api.example.com api.example.com
 
-    # ── Forward with health-checked upstreams and ECS (EDNS Client Subnet) ───
+    # ── Forward with health-checked upstreams ────────────────────────────────
     forward . 1.1.1.1 8.8.8.8 {
         prefer_udp
         health_check 5s
         max_fails 3
         expire 15s
         policy sequential        # try first upstream before failing over
-        # Send EDNS0 Client Subnet for geo-aware CDN responses:
-        # (requires upstream support)
     }
 
     cache 300 {
@@ -117,6 +116,5 @@ example.com:53 {
     # Loop guard
     loop
 
-    prometheus :9153
     reload 30s
 }

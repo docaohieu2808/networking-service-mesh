@@ -1,0 +1,18 @@
+# Istio L1 (companion) - Tracing and access logs with the Telemetry API
+# Replaces the old mesh-wide `enableTracing` + `defaultConfig.tracing.zipkin`
+# fields. The provider `otel-tracing` is declared in meshConfig.extensionProviders
+# (see the Helm values in l1-install-...). A Telemetry resource in istio-system
+# applies mesh-wide; one in a namespace overrides it there.
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: mesh-default
+  namespace: istio-system
+spec:
+  tracing:
+    - providers:
+        - name: otel-tracing
+      randomSamplingPercentage: 100.0   # dev; use 1.0 in production
+  accessLogging:
+    - providers:
+        - name: envoy                   # built-in provider, writes meshConfig.accessLogFile

@@ -4,11 +4,14 @@
 #
 # Usage:
 #   docker run --rm -v $(pwd)/l1-basic-dns-server-forward-cache-health-corefile.Corefile:/Corefile:ro \
-#     -p 53:53/udp -p 53:53/tcp -p 9153:9153 coredns/coredns:latest
+#     -p 1053:53/udp -p 1053:53/tcp -p 9153:9153 -p 8080:8080 coredns/coredns:1.15.0 -conf /Corefile
+#   (use 53:53 instead of 1053:53 on a host where port 53 is free; on Ubuntu
+#    systemd-resolved already owns 127.0.0.53:53)
 #
-# Test:
-#   dig @127.0.0.1 example.com
-#   dig @127.0.0.1 -p 53 google.com A
+# Test (./test.sh runs these in CI):
+#   dig @127.0.0.1 -p 1053 api.internal.example.com +short     # 10.0.1.10 (hosts plugin)
+#   dig @127.0.0.1 -p 1053 google.com A                          # forwarded upstream
+#   curl http://127.0.0.1:8080/health ; curl -s http://127.0.0.1:9153/metrics | head
 
 # ── Root zone: handle all queries ────────────────────────────────────────────
 . {
@@ -39,7 +42,8 @@
     # Prometheus metrics at http://<host>:9153/metrics
     prometheus :9153
 
-    # Log all queries (format: combined includes latency + response code)
+    # Log every query. This is a privacy decision: query names identify what
+    # users do. Fine for a lab, think twice before enabling it on a real resolver.
     log . {
         class all
     }

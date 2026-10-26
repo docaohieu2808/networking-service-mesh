@@ -1,0 +1,10 @@
+extends: relaxed
+rules:
+  line-length: disable          # config files carry long cipher lists and URLs
+  document-start: disable       # multi-document manifests start with a comment
+  comments-indentation: disable
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+  truthy:
+    check-keys: false

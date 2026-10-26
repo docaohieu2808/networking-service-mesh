@@ -1,0 +1,21 @@
+# Opens exactly one path through the namespace-wide deny-all from l4:
+# test-client may GET api-service on 8080. Applied by CI after proving the
+# deny-all really blocks.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-test-client
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: api-service
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/production/sa/test-client"]
+      to:
+        - operation:
+            methods: ["GET"]
+            ports: ["8080"]

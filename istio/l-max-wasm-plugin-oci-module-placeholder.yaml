@@ -1,0 +1,31 @@
+# Istio L-MAX (companion) - WasmPlugin: a compiled filter loaded from an OCI registry
+# Kept apart from the EnvoyFilter file because it cannot work until YOU publish a
+# module: the url below is a PLACEHOLDER and sidecars of matching pods will report
+# a pull error (and, with FAIL_CLOSE, reject traffic) until it points at a real image.
+# CI validates this file against the CRD (server-side dry run) but does not run it.
+# ── WasmPlugin: compiled filter loaded from an OCI registry ──────────────────
+# Build your own with https://github.com/proxy-wasm/proxy-wasm-go-sdk and push it as an
+# OCI artifact (pin `sha256` too).
+apiVersion: extensions.istio.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: custom-auth-wasm-plugin
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: api-service
+  url: oci://registry.example.com/wasm/custom-auth-filter:v1.2.0
+  # sha256: <digest>        # pin the digest in production
+  phase: AUTHN              # UNSPECIFIED_PHASE | AUTHN | AUTHZ | STATS
+  priority: 10              # higher runs earlier within the same phase
+  failStrategy: FAIL_CLOSE  # a broken plugin blocks traffic instead of skipping auth
+  pluginConfig:
+    # Passed to the module's OnConfigure()
+    auth_service_url: "http://auth-service.production.svc.cluster.local:8080"
+    cache_ttl_seconds: 300
+    bypass_paths:
+      - "/health"
+      - "/metrics"
+  imagePullPolicy: IfNotPresent
+  # imagePullSecret: wasm-registry-secret      # for private registries

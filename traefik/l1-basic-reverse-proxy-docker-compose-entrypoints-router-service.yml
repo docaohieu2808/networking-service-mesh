@@ -1,41 +1,75 @@
-# Traefik L1 — Basic Reverse Proxy
-# Demonstrates: EntryPoints, routers, services, Docker provider auto-discovery
-# Usage: docker compose -f l1-basic-reverse-proxy-docker-compose-entrypoints-router-service.yml up -d
-
-version: "3.9"
+# Traefik L1 - Basic reverse proxy
+# Demonstrates: entry points, routers, services, Docker provider auto-discovery,
+#               a socket proxy instead of mounting the raw Docker socket.
+# Image: Traefik v3.7 (current release line).
+# Usage: docker compose -f l1-basic-reverse-proxy-docker-compose-entrypoints-router-service.yml up -d --wait
+#   curl -H 'Host: whoami.localhost' http://127.0.0.1/
+#   curl -H 'Host: api.localhost'    http://127.0.0.1/v1
+#   dashboard (loopback only): http://127.0.0.1:8080/dashboard/
 
 services:
   traefik:
-    image: traefik:v3.0
+    image: traefik:v3.7.16
     container_name: traefik
     restart: unless-stopped
     command:
       # --- Global ---
       - "--log.level=INFO"
       - "--accesslog=true"
+      - "--global.checkNewVersion=false"
 
-      # --- API Dashboard (disable in prod or protect with auth) ---
+      # --- API dashboard: insecure mode serves it on :8080 with no auth, so the
+      #     port is published on loopback only (see ports below). Never expose it. ---
       - "--api.dashboard=true"
-      - "--api.insecure=true"          # dashboard on :8080, no TLS – dev only
+      - "--api.insecure=true"
+      - "--ping=true"                    # /ping on the traefik entrypoint, used by the healthcheck
 
       # --- EntryPoints ---
       - "--entrypoints.web.address=:80"
+      # --- Entry point hardening (Traefik 3.7 warns when these are unset) ---
+      - "--entrypoints.web.http.aliasHeadersStrategy=delete"            # drop X_Auth_User style aliases of managed headers
+      - "--entrypoints.web.http.encodedCharacters.allowEncodedSlash=false"
+      - "--entrypoints.web.http.encodedCharacters.allowEncodedBackSlash=false"
+      - "--entrypoints.web.http.encodedCharacters.allowEncodedNullCharacter=false"
 
       # --- Providers ---
       - "--providers.docker=true"
+      - "--providers.docker.endpoint=tcp://docker-socket-proxy:2375"
       - "--providers.docker.exposedByDefault=false"   # opt-in per container
       - "--providers.docker.network=traefik_net"
     ports:
       - "80:80"
-      - "8080:8080"     # dashboard
+      - "127.0.0.1:8080:8080"            # dashboard, loopback only
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      - docker-socket-proxy
+    networks:
+      - traefik_net
+      - socket_net
+
+  # The Docker socket is root-equivalent even when mounted :ro (the API still
+  # accepts writes). Traefik talks to a filtering proxy that only allows the
+  # read endpoints its Docker provider needs, on a network nothing else joins.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"     # list/inspect containers (labels)
+      NETWORKS: "1"       # resolve container IPs per network
+      EVENTS: "1"         # watch start/stop
+      POST: "0"           # no write calls at all
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
     networks:
-      - traefik_net
+      - socket_net
 
   # Sample backend: whoami echoes request headers
   whoami:
-    image: traefik/whoami
+    image: traefik/whoami:v1.12.0
     container_name: whoami
     restart: unless-stopped
     labels:
@@ -50,7 +84,7 @@ services:
 
   # Second backend matched by Host + PathPrefix
   api-backend:
-    image: traefik/whoami
+    image: traefik/whoami:v1.12.0
     container_name: api-backend
     restart: unless-stopped
     labels:
@@ -65,3 +99,5 @@ networks:
   traefik_net:
     name: traefik_net
     driver: bridge
+  socket_net:
+    internal: true      # only traefik and the socket proxy are attached

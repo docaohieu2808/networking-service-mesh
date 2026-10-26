@@ -1,243 +1,244 @@
 /*
- * Cilium L-MAX — Custom eBPF XDP program: packet filter + per-IP rate limiting
- * Demonstrates: XDP hook, BPF maps (LRU hash, array), per-IP token bucket,
- *               ICMP flood protection, IP allowlist/blocklist, packet parsing
+ * Cilium L-MAX - Custom eBPF XDP program: packet filter + per-source-IP rate limiting
+ * Demonstrates: XDP hook, BPF maps (per-CPU LRU hash, hash, per-CPU array),
+ *               token buckets, blocklist/allowlist, safe packet parsing.
  *
- * Build:
- *   clang -O2 -g -target bpf \
+ * What it limits (and what it deliberately does not):
+ *   - TCP SYN without ACK (new connections)  -> limited   (SYN flood)
+ *   - UDP                                    -> limited   (UDP flood)
+ *   - ICMP                                   -> limited, stricter than TCP/UDP
+ *   - every other TCP packet (established flows, ACKs, data) -> XDP_PASS, never limited
+ * An earlier version ran a catch-all limiter on all packets, which capped every
+ * source at 100 packets/s and starved legitimate established traffic.
+ *
+ * Buckets are per CPU (LRU_PERCPU_HASH): there is no lock and no data race, and
+ * the effective limit is "rate per CPU" - roughly rate x CPUs a source's flows
+ * are spread over by RSS. Use a BPF spin lock or a single-queue NIC if you need
+ * an exact global rate.
+ *
+ * Build (CI does exactly this and also checks the object with llvm-objdump):
+ *   clang -O2 -g -Wall -Werror -target bpf \
  *     -I/usr/include/$(uname -m)-linux-gnu \
- *     -c l-max-ebpf-custom-xdp-packet-filter-rate-limit-program.c \
- *     -o xdp_filter.o
+ *     -c l-max-ebpf-custom-xdp-packet-filter-rate-limit-program.c -o xdp_filter.o
+ *   (packages on Debian/Ubuntu: clang llvm libbpf-dev linux-libc-dev)
  *
- * Load (via iproute2):
- *   ip link set dev eth0 xdp obj xdp_filter.o sec xdp_filter
+ * Load with iproute2 (generic mode works on any NIC and in a VM):
+ *   ip link set dev eth0 xdpgeneric obj xdp_filter.o sec xdp_filter
  *
- * Load (via Cilium custom program — mount in ConfigMap and reference in CiliumConfig):
- *   cilium config set bpf-filter-priority 20
+ * Inspect:  bpftool map show ;  bpftool map dump name pkt_stats
+ * Remove:   ip link set dev eth0 xdpgeneric off
  *
- * Inspect maps:
- *   bpftool map show
- *   bpftool map dump name rate_limit_map
- *
- * Remove:
- *   ip link set dev eth0 xdp off
+ * Cilium note: a NIC can run ONE XDP program. If Cilium's XDP load-balancer
+ * acceleration (loadBalancer.acceleration) is active on that NIC, attaching this
+ * program replaces it. Run this on a NIC Cilium does not manage, or chain both
+ * with a libxdp dispatcher. There is no `cilium config` key that loads a custom
+ * XDP object.
  */
 
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
+#include <linux/in.h>
 #include <linux/ip.h>
-#include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/icmp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-/* ── Constants ─────────────────────────────────────────────────────────────── */
-#define MAX_ENTRIES         65536
-#define RATE_LIMIT_TOKENS   100         /* max tokens per bucket */
-#define TOKEN_REFILL_NS     10000000ULL /* refill 1 token per 10ms (100 pps max) */
-#define ICMP_RATE_LIMIT     10          /* max ICMP packets per refill window */
-#define BLOCKLIST_MAX       1024
+#define MAX_ENTRIES      65536
+#define BLOCKLIST_MAX    1024
+#define ALLOWLIST_MAX    256
 
-/* ── BPF map: per-IP rate limit state (token bucket) ───────────────────────── */
-struct rate_limit_entry {
-    __u64 tokens;           /* current token count */
-    __u64 last_refill_ns;   /* timestamp of last token refill */
+/* One independent bucket per (source IP, traffic class). */
+enum rl_class {
+    RL_TCP_SYN = 0,
+    RL_UDP     = 1,
+    RL_ICMP    = 2,
+};
+
+struct rl_key {
+    __u32 ip;       /* source IPv4 address, network byte order */
+    __u32 class;    /* enum rl_class */
+};
+
+struct rl_bucket {
+    __u64 tokens;
+    __u64 last_refill_ns;
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
     __uint(max_entries, MAX_ENTRIES);
-    __type(key,   __u32);                   /* source IPv4 address */
-    __type(value, struct rate_limit_entry);
+    __type(key,   struct rl_key);
+    __type(value, struct rl_bucket);
 } rate_limit_map SEC(".maps");
 
-/* ── BPF map: IP blocklist (drop all traffic from these IPs) ────────────────── */
+/* Drop everything from these sources. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, BLOCKLIST_MAX);
-    __type(key,   __u32);   /* IPv4 address */
-    __type(value, __u8);    /* 1 = blocked */
+    __type(key,   __u32);
+    __type(value, __u8);
 } ip_blocklist SEC(".maps");
 
-/* ── BPF map: IP allowlist (bypass rate limiting for trusted IPs) ───────────── */
+/* Skip rate limiting for these sources. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
-    __type(key,   __u32);   /* IPv4 address */
-    __type(value, __u8);    /* 1 = trusted */
+    __uint(max_entries, ALLOWLIST_MAX);
+    __type(key,   __u32);
+    __type(value, __u8);
 } ip_allowlist SEC(".maps");
 
-/* ── BPF map: per-protocol packet counters (for observability) ──────────────── */
 struct pkt_counters {
     __u64 tcp_packets;
     __u64 udp_packets;
     __u64 icmp_packets;
     __u64 dropped_blocklist;
     __u64 dropped_ratelimit;
+    __u64 dropped_malformed;
     __u64 passed_total;
 };
 
+/* Per-CPU array: each CPU bumps its own copy, userspace sums them. */
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key,   __u32);
     __type(value, struct pkt_counters);
 } pkt_stats SEC(".maps");
 
-/* ── Helper: update token bucket, return 1 if packet allowed ───────────────── */
-static __always_inline int check_rate_limit(__u32 src_ip)
+/* Burst size and refill period per class. ICMP is the strictest. */
+static __always_inline void class_params(__u32 class, __u64 *burst, __u64 *refill_ns)
 {
-    struct rate_limit_entry *entry;
-    struct rate_limit_entry  new_entry = {};
+    switch (class) {
+    case RL_TCP_SYN:
+        *burst = 100;  *refill_ns = 10000000ULL;   /* 100 new connections/s */
+        break;
+    case RL_UDP:
+        *burst = 200;  *refill_ns = 5000000ULL;    /* 200 datagrams/s */
+        break;
+    default: /* RL_ICMP */
+        *burst = 10;   *refill_ns = 100000000ULL;  /* 10 packets/s */
+        break;
+    }
+}
+
+/* Token bucket: returns 1 if the packet may pass, 0 if the bucket is empty. */
+static __always_inline int take_token(__u32 ip, __u32 class)
+{
+    struct rl_key key = { .ip = ip, .class = class };
+    struct rl_bucket *b;
+    __u64 burst, refill_ns;
     __u64 now = bpf_ktime_get_ns();
 
-    entry = bpf_map_lookup_elem(&rate_limit_map, &src_ip);
-    if (!entry) {
-        /* First packet from this IP — initialise bucket */
-        new_entry.tokens        = RATE_LIMIT_TOKENS - 1;
-        new_entry.last_refill_ns = now;
-        bpf_map_update_elem(&rate_limit_map, &src_ip, &new_entry, BPF_ANY);
-        return 1; /* allow */
+    class_params(class, &burst, &refill_ns);
+
+    b = bpf_map_lookup_elem(&rate_limit_map, &key);
+    if (!b) {
+        struct rl_bucket fresh = { .tokens = burst - 1, .last_refill_ns = now };
+        bpf_map_update_elem(&rate_limit_map, &key, &fresh, BPF_ANY);
+        return 1;
     }
 
-    /* Refill tokens based on elapsed time */
-    __u64 elapsed  = now - entry->last_refill_ns;
-    __u64 new_tokens = elapsed / TOKEN_REFILL_NS;
-
-    if (new_tokens > 0) {
-        entry->tokens += new_tokens;
-        if (entry->tokens > RATE_LIMIT_TOKENS)
-            entry->tokens = RATE_LIMIT_TOKENS;
-        entry->last_refill_ns = now;
+    __u64 added = (now - b->last_refill_ns) / refill_ns;
+    if (added > 0) {
+        __u64 t = b->tokens + added;
+        b->tokens = t > burst ? burst : t;
+        b->last_refill_ns += added * refill_ns;   /* keep the fractional remainder */
     }
 
-    if (entry->tokens == 0)
-        return 0; /* drop: bucket empty */
-
-    entry->tokens--;
-    return 1; /* allow */
+    if (b->tokens == 0)
+        return 0;
+    b->tokens--;
+    return 1;
 }
 
-/* ── Helper: increment a counter field in pkt_stats ────────────────────────── */
-static __always_inline void count_pkt(__u64 *field)
-{
-    __u32 key = 0;
-    struct pkt_counters *stats = bpf_map_lookup_elem(&pkt_stats, &key);
-    if (stats)
-        __sync_fetch_and_add(field, 1);
-}
-
-/* ── XDP program entry point ────────────────────────────────────────────────── */
 SEC("xdp_filter")
 int xdp_packet_filter(struct xdp_md *ctx)
 {
     void *data_end = (void *)(long)ctx->data_end;
     void *data     = (void *)(long)ctx->data;
+    __u32 zero = 0;
+    struct pkt_counters *stats = bpf_map_lookup_elem(&pkt_stats, &zero);
 
-    /* ── Parse Ethernet header ──────────────────────────────────────────────── */
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        return XDP_DROP;
+        goto malformed;
 
-    /* Only process IPv4 (pass IPv6 and ARP through unmodified) */
+    /* Only IPv4 is filtered; ARP, IPv6, ... pass untouched. */
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
 
-    /* ── Parse IP header ────────────────────────────────────────────────────── */
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
-        return XDP_DROP;
+        goto malformed;
+    if (iph->ihl < 5)
+        goto malformed;
 
     __u32 src_ip = iph->saddr;
-    __u32 dst_ip = iph->daddr;
-    __u8  proto  = iph->protocol;
 
-    /* ── Blocklist check: drop immediately ──────────────────────────────────── */
+    /* Blocklist first: cheapest way to shed known bad sources. */
     __u8 *blocked = bpf_map_lookup_elem(&ip_blocklist, &src_ip);
     if (blocked && *blocked == 1) {
-        __u32 key = 0;
-        struct pkt_counters *stats = bpf_map_lookup_elem(&pkt_stats, &key);
         if (stats)
-            __sync_fetch_and_add(&stats->dropped_blocklist, 1);
+            stats->dropped_blocklist++;
         return XDP_DROP;
     }
 
-    /* ── Allowlist check: bypass rate limiting for trusted sources ──────────── */
+    /* Trusted sources skip the limiter entirely. */
     __u8 *trusted = bpf_map_lookup_elem(&ip_allowlist, &src_ip);
     if (trusted && *trusted == 1) {
-        __u32 key = 0;
-        struct pkt_counters *stats = bpf_map_lookup_elem(&pkt_stats, &key);
         if (stats)
-            __sync_fetch_and_add(&stats->passed_total, 1);
+            stats->passed_total++;
         return XDP_PASS;
     }
 
-    /* ── Protocol-specific handling ─────────────────────────────────────────── */
-    __u32 key = 0;
-    struct pkt_counters *stats = bpf_map_lookup_elem(&pkt_stats, &key);
+    void *l4 = (void *)iph + (iph->ihl * 4);
+    __u32 class;
 
-    if (proto == IPPROTO_ICMP) {
-        /* Parse ICMP header */
-        struct icmphdr *icmph = (void *)iph + (iph->ihl * 4);
-        if ((void *)(icmph + 1) > data_end)
-            return XDP_DROP;
-
-        if (stats)
-            __sync_fetch_and_add(&stats->icmp_packets, 1);
-
-        /* ICMP flood protection: stricter rate limit */
-        if (!check_rate_limit(src_ip | 0x80000000U)) { /* separate bucket for ICMP */
-            if (stats)
-                __sync_fetch_and_add(&stats->dropped_ratelimit, 1);
-            return XDP_DROP;
-        }
-
-    } else if (proto == IPPROTO_TCP) {
-        struct tcphdr *tcph = (void *)iph + (iph->ihl * 4);
+    if (iph->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcph = l4;
         if ((void *)(tcph + 1) > data_end)
-            return XDP_DROP;
-
+            goto malformed;
         if (stats)
-            __sync_fetch_and_add(&stats->tcp_packets, 1);
-
-        /* SYN flood mitigation: rate-limit SYN-only packets */
-        if (tcph->syn && !tcph->ack) {
-            if (!check_rate_limit(src_ip)) {
-                if (stats)
-                    __sync_fetch_and_add(&stats->dropped_ratelimit, 1);
-                return XDP_DROP;
-            }
-        }
-
-    } else if (proto == IPPROTO_UDP) {
-        struct udphdr *udph = (void *)iph + (iph->ihl * 4);
+            stats->tcp_packets++;
+        /* Established traffic is never limited here. */
+        if (!(tcph->syn && !tcph->ack))
+            goto pass;
+        class = RL_TCP_SYN;
+    } else if (iph->protocol == IPPROTO_UDP) {
+        struct udphdr *udph = l4;
         if ((void *)(udph + 1) > data_end)
-            return XDP_DROP;
-
+            goto malformed;
         if (stats)
-            __sync_fetch_and_add(&stats->udp_packets, 1);
-
-        /* UDP flood protection */
-        if (!check_rate_limit(src_ip)) {
-            if (stats)
-                __sync_fetch_and_add(&stats->dropped_ratelimit, 1);
-            return XDP_DROP;
-        }
+            stats->udp_packets++;
+        class = RL_UDP;
+    } else if (iph->protocol == IPPROTO_ICMP) {
+        struct icmphdr *icmph = l4;
+        if ((void *)(icmph + 1) > data_end)
+            goto malformed;
+        if (stats)
+            stats->icmp_packets++;
+        class = RL_ICMP;
+    } else {
+        goto pass;      /* other protocols: not our business */
     }
 
-    /* ── Global rate limit check for all remaining traffic ──────────────────── */
-    if (!check_rate_limit(src_ip)) {
+    if (!take_token(src_ip, class)) {
         if (stats)
-            __sync_fetch_and_add(&stats->dropped_ratelimit, 1);
+            stats->dropped_ratelimit++;
         return XDP_DROP;
     }
 
+pass:
     if (stats)
-        __sync_fetch_and_add(&stats->passed_total, 1);
-
+        stats->passed_total++;
     return XDP_PASS;
+
+malformed:
+    if (stats)
+        stats->dropped_malformed++;
+    return XDP_DROP;
 }
 
 char _license[] SEC("license") = "GPL";

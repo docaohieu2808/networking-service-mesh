@@ -3,7 +3,10 @@
 #               HTTP method/path rules, toFQDNs, namespace selectors
 #
 # Apply: kubectl apply -f l2-network-policy-l7-http-dns-egress-ingress-cilium-network-policy.yaml
-# Prereq: Cilium installed with L7 proxy enabled (default)
+# Prereq: Cilium installed with the L7 proxy enabled (default); namespace production exists.
+# Order: apply the default-deny policy first, then the allow policies on top.
+# The node-level firewall that used to live in this file is now l3 (it needs
+# hostFirewall.enabled=true, which l1 keeps off).
 
 ---
 # ── CiliumNetworkPolicy: api-service — full L3/L4/L7 policy ──────────────────
@@ -40,21 +43,14 @@ spec:
                 path: /api/users/[^/]+
               - method: DELETE
                 path: /api/users/[^/]+
-                # Require specific header for DELETE (extra safety)
+                # Require a header for DELETE (extra safety). Header rules are
+                # STRINGS in "Name: value" form, not a map.
                 headers:
-                  - X-Confirm-Delete: "true"
+                  - "X-Confirm-Delete: true"
 
-    # Allow health checks from kube-system (kubelet probes via node IP)
-    - fromEntities:
-        - host           # the node itself (kubelet)
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-          rules:
-            http:
-              - method: GET
-                path: /health
+    # No rule is needed for kubelet probes: Cilium always allows traffic from the
+    # local node (entity `host`) to its pods, and L7 rules cannot be applied to
+    # the host entity anyway.
 
     # Allow Prometheus scraping from monitoring namespace
     - fromEndpoints:
@@ -66,9 +62,9 @@ spec:
             - port: "9090"
               protocol: TCP
 
-    # Allow ingress from Cilium's Hubble relay (observability)
-    - fromEntities:
-        - cluster
+    # (An earlier version ended with `fromEntities: cluster` "for Hubble relay".
+    #  That admits every pod in the cluster and cancels the L7 allow-list above.
+    #  Hubble relay talks to the Cilium agents, not to your pods, so it needs no rule.)
 
   # ── EGRESS rules ──────────────────────────────────────────────────────────
   egress:
@@ -159,51 +155,3 @@ spec:
               protocol: UDP
             - port: "53"
               protocol: TCP
-
----
-# ── CiliumClusterwideNetworkPolicy: node-level firewall ──────────────────────
-# Cluster-scoped (not namespaced) — applies to host network stack.
-# Requires hostFirewall.enabled=true in Cilium Helm values.
-apiVersion: cilium.io/v2
-kind: CiliumClusterwideNetworkPolicy
-metadata:
-  name: node-ingress-allow-ssh-api
-spec:
-  # Targets the node itself (not pods)
-  nodeSelector:
-    matchLabels:
-      kubernetes.io/os: linux
-  ingress:
-    # Allow SSH only from bastion subnet
-    - fromCIDR:
-        - 10.0.100.0/24    # bastion host CIDR
-      toPorts:
-        - ports:
-            - port: "22"
-              protocol: TCP
-
-    # Allow K8s API from all cluster nodes
-    - fromEntities:
-        - cluster
-      toPorts:
-        - ports:
-            - port: "6443"
-              protocol: TCP
-            - port: "2379"    # etcd
-              protocol: TCP
-            - port: "2380"    # etcd peer
-              protocol: TCP
-
-    # Allow kubelet API from cluster nodes
-    - fromEntities:
-        - cluster
-      toPorts:
-        - ports:
-            - port: "10250"
-              protocol: TCP
-
-  egress:
-    # Allow all egress from nodes (restrict further as needed)
-    - toEntities:
-        - world
-        - cluster

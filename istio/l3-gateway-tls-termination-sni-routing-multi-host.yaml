@@ -2,14 +2,18 @@
 # Demonstrates: Gateway resource, TLS termination, HTTPS redirect, SNI passthrough,
 #               multi-host routing, wildcard certs, cross-namespace VirtualService binding
 #
+# Classic Istio APIs (networking.istio.io/v1). The Kubernetes Gateway API
+# equivalent is in l3b-gateway-api-httproute-waypoint.yaml.
+#
 # Apply: kubectl apply -f l3-gateway-tls-termination-sni-routing-multi-host.yaml
-# Prereq: TLS secret in istio-system namespace:
-#   kubectl -n istio-system create secret tls example-tls \
+# Prereq: the ingress gateway from l1c (label istio: ingressgateway) and one TLS
+# secret per credentialName below, in the gateway's namespace (istio-system):
+#   kubectl -n istio-system create secret tls app-example-tls \
 #     --cert=fullchain.pem --key=privkey.pem
 
 ---
 # ── Gateway: HTTP → HTTPS redirect ───────────────────────────────────────────
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
   name: http-redirect-gateway
@@ -31,7 +35,7 @@ spec:
 
 ---
 # ── Gateway: HTTPS TLS termination for multiple hosts ────────────────────────
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
   name: https-gateway
@@ -78,7 +82,7 @@ spec:
 
 ---
 # ── Gateway: SNI passthrough — TLS not terminated, routed by SNI ─────────────
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
   name: tls-passthrough-gateway
@@ -98,7 +102,7 @@ spec:
 
 ---
 # ── VirtualService: app.example.com routing (bound to https-gateway) ─────────
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: app-virtualservice
@@ -134,7 +138,7 @@ spec:
 
 ---
 # ── VirtualService: SNI passthrough for db.example.com ───────────────────────
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: db-passthrough-virtualservice
@@ -158,7 +162,7 @@ spec:
 
 ---
 # ── VirtualService: wildcard API subdomain routing ────────────────────────────
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: api-wildcard-virtualservice

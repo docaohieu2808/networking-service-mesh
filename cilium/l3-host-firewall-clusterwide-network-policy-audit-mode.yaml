@@ -1,0 +1,72 @@
+# Cilium L3 - Host firewall: CiliumClusterwideNetworkPolicy for the nodes themselves
+# Demonstrates: nodeSelector policies, why you audit before you enforce.
+#
+# Needs: --set hostFirewall.enabled=true (off in l1). Turn it on together with
+#   --set policyAuditMode=true
+# first: in audit mode the policy only LOGS what it would drop (cilium monitor
+# -t policy-verdict / hubble observe --verdict AUDIT). Enforce only after the log
+# is clean. A wrong host policy cuts you off from the node, including SSH and the
+# API server, and there is no console to fix it from.
+#
+# Apply: kubectl apply -f l3-host-firewall-clusterwide-network-policy-audit-mode.yaml
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: node-ingress-baseline
+spec:
+  description: "Allow SSH from the bastion, control-plane and kubelet ports from the cluster, and what Cilium itself needs"
+  nodeSelector:
+    matchLabels:
+      kubernetes.io/os: linux
+  ingress:
+    # SSH only from the bastion subnet
+    - fromCIDR:
+        - 10.0.100.0/24
+      toPorts:
+        - ports:
+            - port: "22"
+              protocol: TCP
+
+    # Kubernetes control plane + kubelet, from cluster nodes and pods
+    - fromEntities:
+        - cluster
+      toPorts:
+        - ports:
+            - port: "6443"     # kube-apiserver
+              protocol: TCP
+            - port: "2379"     # etcd client
+              protocol: TCP
+            - port: "2380"     # etcd peer
+              protocol: TCP
+            - port: "10250"    # kubelet
+              protocol: TCP
+
+    # What Cilium needs between nodes: without these the cluster falls apart
+    - fromEntities:
+        - cluster
+      toPorts:
+        - ports:
+            - port: "4240"     # cilium-health
+              protocol: TCP
+            - port: "4244"     # hubble server
+              protocol: TCP
+            - port: "8472"     # VXLAN overlay (when routingMode: tunnel)
+              protocol: UDP
+            - port: "51871"    # WireGuard (when encryption is on)
+              protocol: UDP
+
+    # ICMP: health checks and path MTU discovery depend on it
+    - fromEntities:
+        - cluster
+      icmps:
+        - fields:
+            - type: 8          # echo request
+              family: IPv4
+            - type: EchoRequest
+              family: IPv6
+
+  egress:
+    # Nodes may reach anything; tighten once ingress is proven
+    - toEntities:
+        - world
+        - cluster
