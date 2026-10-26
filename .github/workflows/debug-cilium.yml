@@ -10,8 +10,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {name: A-as-is, sets: ""}
-          - {name: B-tunnel, sets: "--set routingMode=tunnel --set tunnelProtocol=vxlan --set autoDirectNodeRoutes=false"}
+          - {name: V1-nosocketlb, sets: "--set socketLB.enabled=false"}
+          - {name: V2-nobw-noxdp-nomasq, sets: "--set bandwidthManager.enabled=false --set loadBalancer.acceleration=disabled --set bpf.masquerade=false"}
+          - {name: V3-minimal, sets: "--set routingMode=tunnel --set tunnelProtocol=vxlan --set autoDirectNodeRoutes=false --set bandwidthManager.enabled=false --set loadBalancer.acceleration=disabled --set bpf.masquerade=false --set hubble.enabled=false --set hubble.relay.enabled=false --set hubble.ui.enabled=false"}
+          - {name: V4-lbalg-default, sets: "--set loadBalancer.algorithm=random"}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: .github/scripts/install-tools.sh kind helm
