@@ -10,6 +10,15 @@ kubectl apply -f lab/test-workloads.yaml
 kubectl -n production rollout status deploy/api-service --timeout=180s
 kubectl -n production rollout status deploy/frontend --timeout=180s
 kubectl -n production rollout status deploy/intruder --timeout=180s
+# Baseline before any policy: if this fails the cluster network is broken, not the policies.
+url=http://api-service.production.svc.cluster.local:8080
+for _ in $(seq 1 30); do
+  b=$(kubectl -n production exec deploy/frontend -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url/" 2>/dev/null || true)
+  [ "$b" = "200" ] && break
+  sleep 2
+done
+[ "$b" = "200" ] || { echo "FAIL baseline (no policy applied): got '$b'"; kubectl -n production exec deploy/frontend -- curl -sv --max-time 5 "$url/" 2>&1 | tail -10; kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status 2>&1 | head -30; exit 1; }
+echo "ok   baseline: frontend reaches api-service before any policy"
 kubectl apply -f l2-network-policy-l7-http-dns-egress-ingress-cilium-network-policy.yaml
 kubectl apply -f l3-host-firewall-clusterwide-network-policy-audit-mode.yaml   # schema check only: host firewall is off
 
