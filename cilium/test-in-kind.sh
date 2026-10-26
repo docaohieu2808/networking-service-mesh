@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Uses the Service ClusterIP, not its DNS name: see "Honest limits" in the README.
 # Behavioural test of the l2 policies on a cluster that runs Cilium as its CNI.
 # Proves the L7 allow-list works AND that the old `fromEntities: cluster` hole is gone:
 # a pod in the same namespace that the policy does not name must be unable to connect.
@@ -11,7 +12,7 @@ kubectl -n production rollout status deploy/api-service --timeout=180s
 kubectl -n production rollout status deploy/frontend --timeout=180s
 kubectl -n production rollout status deploy/intruder --timeout=180s
 # Baseline before any policy: if this fails the cluster network is broken, not the policies.
-url=http://api-service.production.svc.cluster.local:8080
+url=http://$(kubectl -n production get svc api-service -o jsonpath='{.spec.clusterIP}'):8080
 for _ in $(seq 1 30); do
   b=$(kubectl -n production exec deploy/frontend -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url/" 2>/dev/null || true)
   [ "$b" = "200" ] && break
@@ -22,7 +23,7 @@ echo "ok   baseline: frontend reaches api-service before any policy"
 kubectl apply -f l2-network-policy-l7-http-dns-egress-ingress-cilium-network-policy.yaml
 kubectl apply -f l3-host-firewall-clusterwide-network-policy-audit-mode.yaml   # schema check only: host firewall is off
 
-url=http://api-service.production.svc.cluster.local:8080
+url=http://$(kubectl -n production get svc api-service -o jsonpath='{.spec.clusterIP}'):8080
 code() { # pod  method  path  [extra curl args]
   local pod=$1 method=$2 path=$3; shift 3
   kubectl -n production exec "deploy/$pod" -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X "$method" "$@" "$url$path" 2>/dev/null || true

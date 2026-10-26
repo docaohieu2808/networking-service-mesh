@@ -89,7 +89,7 @@ There is no l-max, TrafficSplit or SMI: SMI support was removed from Linkerd; HT
 ### Cilium (`cilium/`)
 | Level | File | What it teaches |
 |-------|------|-----------------|
-| l1 | `l1-install-helm-values-kubeproxy-replacement-hubble-enabled.yaml` | kube-proxy replacement, native routing, Hubble (eBPF masquerade is a documented switch, off because it broke DNS on kind) |
+| l1 | `l1-install-helm-values-kubeproxy-replacement-hubble-enabled.yaml` | kube-proxy replacement, native routing, eBPF masquerade, Hubble |
 | l2 | `l2-network-policy-l7-http-dns-egress-ingress-cilium-network-policy.yaml` | default deny, L7 HTTP rules, DNS-aware egress |
 | l3 | `l3-host-firewall-clusterwide-network-policy-audit-mode.yaml` | node-level policy; audit before enforce |
 | l-max | `l-max-ebpf-custom-xdp-packet-filter-rate-limit-program.c` | XDP program: blocklist/allowlist, token buckets for SYN/UDP/ICMP only |
@@ -168,6 +168,10 @@ Dependabot updates actions, the OpenResty Dockerfile and the Traefik compose ima
   image. CI validates it against the CRD (server-side dry run) but cannot run it.
 - Istio runs on one-node `kind`, so HA settings (replicas, anti-affinity) are lowered with
   `--set` in CI; the files keep the production values.
+- Cilium on kind: with these values, `curl` 8.23 (musl) pods could not resolve cluster DNS names
+  in CI (`nslookup` from the same pod worked; cause not found after bisecting values), so the
+  policy test talks to the Service ClusterIP. DNS-aware egress rules (`toFQDNs`) are therefore
+  schema-checked, not exercised.
 - The Cilium host firewall (l3) is only schema-checked; enabling it on a CI node could cut the runner off.
 - The XDP program uses `xdpgeneric` in a network namespace. Native-mode XDP and exact limits
   across many CPUs are not tested (buckets are per CPU).
